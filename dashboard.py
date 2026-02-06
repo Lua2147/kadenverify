@@ -107,8 +107,57 @@ def verify_batch(emails: List[str], progress_callback=None, max_workers=10) -> L
 
     # Sort results to match input order
     email_to_result = {r['email']: r for r in results}
-    return [email_to_result.get(email, {"email": email, "status": "error", "error": "not processed"})
-            for email in emails]
+    ordered_results = [email_to_result.get(email, {"email": email, "status": "error", "error": "not processed"})
+                       for email in emails]
+
+    # Option 3: Retry unknowns with different strategy
+    unknowns = [r for r in ordered_results if r.get('status') == 'unknown']
+    if unknowns and progress_callback:
+        progress_callback(completed, total, retry_phase=True, unknowns_count=len(unknowns))
+
+    if unknowns:
+        time.sleep(2)  # Brief delay before retry
+
+        # Retry with longer timeout and lower concurrency
+        retry_results = []
+        for i, unknown in enumerate(unknowns):
+            try:
+                # Longer timeout for retry
+                response = SESSION.get(
+                    f"{API_URL}/verify",
+                    params={"email": unknown['email'], "force_full_check": "true"},
+                    timeout=300  # 5 minute timeout for difficult domains
+                )
+                if response.status_code == 200:
+                    retry_result = response.json()
+                    retry_results.append(retry_result)
+                else:
+                    retry_results.append(unknown)
+
+                # Progress update for retries
+                if progress_callback and i % 5 == 0:
+                    progress_callback(completed, total, retry_phase=True,
+                                    retry_progress=f"{i+1}/{len(unknowns)}")
+
+                time.sleep(1)  # Delay between retries to avoid rate limiting
+            except:
+                retry_results.append(unknown)
+
+        # Merge retry results back
+        retry_email_to_result = {r['email']: r for r in retry_results}
+        ordered_results = [retry_email_to_result.get(r['email'], r)
+                          for r in ordered_results]
+
+    # Option 1: Reclassify remaining unknowns as risky
+    for result in ordered_results:
+        if result.get('status') == 'unknown':
+            result['status'] = 'risky'
+            result['reachability'] = 'risky'
+            result['is_deliverable'] = False
+            if 'error' not in result:
+                result['risk_reason'] = 'Unable to verify - treat as risky'
+
+    return ordered_results
 
 
 def parse_uploaded_file(uploaded_file) -> List[str]:
@@ -198,16 +247,18 @@ def main():
         st.subheader("ℹ️ About")
         st.markdown("""
         **KadenVerify** verifies emails using:
-        - SMTP handshake
+        - SMTP handshake (with retry)
         - DNS MX lookup
         - Catch-all detection
         - Pattern matching
 
         **Status meanings:**
-        - ✅ **valid** - Deliverable
-        - ⚠️ **catch_all** - Risky
-        - ❌ **invalid** - Bounces
-        - ❓ **unknown** - Unclear
+        - ✅ **valid** - Safe to send
+        - ⚠️ **risky** - Send with caution
+        - ❌ **invalid** - Will bounce
+
+        **Note:** Unknowns are automatically
+        retried and marked as risky.
         """)
 
     # Main content
@@ -246,10 +297,16 @@ def main():
                     progress_bar = st.progress(0)
                     status_text = st.empty()
 
-                    def update_progress(current, total):
-                        progress = current / total
-                        progress_bar.progress(progress)
-                        status_text.text(f"Verified {current}/{total} emails ({progress:.0%})")
+                    def update_progress(current, total, retry_phase=False, unknowns_count=0, retry_progress=""):
+                        if retry_phase:
+                            if retry_progress:
+                                status_text.text(f"🔄 Retrying unknowns with extended timeout... {retry_progress}")
+                            else:
+                                status_text.text(f"🔄 Found {unknowns_count} unknowns - retrying with longer timeout...")
+                        else:
+                            progress = current / total
+                            progress_bar.progress(progress)
+                            status_text.text(f"Verified {current}/{total} emails ({progress:.0%})")
 
                     # Verify
                     start_time = time.time()
@@ -269,9 +326,9 @@ def main():
                     col1, col2, col3, col4 = st.columns(4)
 
                     safe_count = len(df[df['status'] == 'valid'])
-                    risky_count = len(df[df['status'].isin(['catch_all', 'risky'])])
+                    risky_count = len(df[df['status'].isin(['catch_all', 'risky', 'unknown'])])
                     invalid_count = len(df[df['status'] == 'invalid'])
-                    unknown_count = len(df[df['status'] == 'unknown'])
+                    error_count = len(df[df['status'] == 'error'])
 
                     with col1:
                         st.markdown(f"""
@@ -300,8 +357,8 @@ def main():
                     with col4:
                         st.markdown(f"""
                         <div class="stat-box" style="background: linear-gradient(135deg, #94a3b8 0%, #64748b 100%);">
-                            <div class="stat-number">{unknown_count}</div>
-                            <div class="stat-label">❓ Unknown</div>
+                            <div class="stat-number">{error_count}</div>
+                            <div class="stat-label">⚠️ Errors</div>
                         </div>
                         """, unsafe_allow_html=True)
 
@@ -333,16 +390,18 @@ def main():
                     result = verify_email(email)
 
                 # Display result
-                status = result.get('status', 'unknown')
+                status = result.get('status', 'risky')
 
                 if status == 'valid':
                     st.success("✅ Email is valid and deliverable!")
-                elif status in ['catch_all', 'risky']:
-                    st.warning("⚠️ Email is risky (catch-all domain or other issues)")
+                elif status in ['catch_all', 'risky', 'unknown']:
+                    st.warning("⚠️ Email is risky - send with caution")
+                    if 'risk_reason' in result:
+                        st.caption(f"Reason: {result['risk_reason']}")
                 elif status == 'invalid':
                     st.error("❌ Email is invalid or will bounce")
                 else:
-                    st.info("❓ Could not determine email status")
+                    st.error(f"⚠️ Error: {result.get('error', 'Verification failed')}")
 
                 # Show details
                 with st.expander("📋 Details", expanded=True):
@@ -385,7 +444,7 @@ def main():
             with col1:
                 status_filter = st.multiselect(
                     "Filter by status",
-                    options=['valid', 'catch_all', 'risky', 'invalid', 'unknown'],
+                    options=['valid', 'risky', 'invalid', 'error'],
                     default=[]
                 )
             with col2:
