@@ -15,10 +15,15 @@ import io
 import time
 from datetime import datetime
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration
 API_URL = "http://localhost:8025"
 API_KEY = st.secrets.get("KADENVERIFY_API_KEY", "your-api-key-here")
+
+# Create a session for connection pooling
+SESSION = requests.Session()
+SESSION.headers.update({"X-API-Key": API_KEY})
 
 # Page config
 st.set_page_config(
@@ -59,10 +64,9 @@ st.markdown("""
 def verify_email(email: str) -> Dict:
     """Verify a single email via API."""
     try:
-        response = requests.get(
+        response = SESSION.get(
             f"{API_URL}/verify",
             params={"email": email},
-            headers={"X-API-Key": API_KEY},
             timeout=30
         )
         if response.status_code == 200:
@@ -81,22 +85,30 @@ def verify_email(email: str) -> Dict:
         }
 
 
-def verify_batch(emails: List[str], progress_callback=None) -> List[Dict]:
-    """Verify multiple emails with progress tracking."""
+def verify_batch(emails: List[str], progress_callback=None, max_workers=20) -> List[Dict]:
+    """Verify multiple emails with concurrent processing and progress tracking."""
     results = []
     total = len(emails)
+    completed = 0
 
-    for i, email in enumerate(emails):
-        result = verify_email(email)
-        results.append(result)
+    # Use ThreadPoolExecutor for concurrent requests
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_email = {executor.submit(verify_email, email): email for email in emails}
 
-        if progress_callback:
-            progress_callback(i + 1, total)
+        # Process completed futures as they finish
+        for future in as_completed(future_to_email):
+            result = future.result()
+            results.append(result)
+            completed += 1
 
-        # Small delay to avoid overwhelming API
-        time.sleep(0.1)
+            if progress_callback:
+                progress_callback(completed, total)
 
-    return results
+    # Sort results to match input order
+    email_to_result = {r['email']: r for r in results}
+    return [email_to_result.get(email, {"email": email, "status": "error", "error": "not processed"})
+            for email in emails]
 
 
 def parse_uploaded_file(uploaded_file) -> List[str]:
