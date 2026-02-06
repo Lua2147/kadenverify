@@ -18,8 +18,8 @@ from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration
-API_URL = "http://198.23.249.137:8025"  # RackNerd server with port 25 open
-API_KEY = st.secrets.get("KADENVERIFY_API_KEY", "131245c8cc9ac8ae3d69f3a7f7e85164a29c08403483aa7b2f3608f53e5765a6")
+API_URL = "http://localhost:8025"  # Local API with port 25 now unblocked!
+API_KEY = st.secrets.get("KADENVERIFY_API_KEY", "kadenwood_verify_2026")
 
 # Create a session for connection pooling
 SESSION = requests.Session()
