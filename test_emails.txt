@@ -1,0 +1,131 @@
+# Test Email List - 100 emails with various scenarios
+# Valid emails (major providers)
+test.user@gmail.com
+john.smith@yahoo.com
+jane.doe@outlook.com
+contact@hotmail.com
+admin@protonmail.com
+
+# Valid corporate emails (likely safe)
+ceo@apple.com
+info@microsoft.com
+support@salesforce.com
+team@stripe.com
+hello@shopify.com
+
+# Gmail addresses (various formats)
+johndoe123@gmail.com
+jane.m.smith@gmail.com
+business.contact@gmail.com
+test.account@gmail.com
+random.user@gmail.com
+
+# Yahoo addresses
+mike.johnson@yahoo.com
+sarah.williams@yahoo.com
+contact.us@yahoo.com
+team.lead@yahoo.com
+project.manager@yahoo.com
+
+# Microsoft 365 / Outlook
+sales@outlook.com
+marketing@hotmail.com
+john.corporate@outlook.com
+jane.business@hotmail.com
+team.alpha@outlook.com
+
+# Catch-all domains (need validation)
+john.smith@example.com
+jane.doe@example.org
+contact@example.net
+team@example.co
+sales@example.io
+
+# More catch-all scenarios
+ceo@startupcompany.com
+founder@techfirm.io
+contact@consultinggroup.com
+sales@marketingagency.co
+team@designstudio.com
+
+# Invalid format (should fail syntax)
+notanemail
+@missinglocal.com
+missingatsign.com
+double@@at.com
+spaces in@email.com
+
+# Disposable domains (should be flagged)
+test@tempmail.com
+user@guerrillamail.com
+temp@10minutemail.com
+throwaway@mailinator.com
+fake@trashmail.com
+
+# Role accounts (should be flagged)
+admin@company.com
+info@business.com
+support@service.com
+webmaster@website.com
+postmaster@domain.com
+sales@corporation.com
+marketing@enterprise.com
+noreply@system.com
+contact@organization.com
+help@platform.com
+
+# Generic/unknown domains (mixed)
+user@smallbusiness.com
+contact@localbakery.com
+owner@familystore.com
+manager@boutiqueshop.com
+director@consultancy.com
+
+# Tech company emails
+engineer@github.com
+developer@gitlab.com
+designer@figma.com
+product@notion.so
+growth@hubspot.com
+
+# More Gmail variations
+test123@gmail.com
+myname@gmail.com
+personal.email@gmail.com
+work.contact@gmail.com
+side.project@gmail.com
+
+# Educational domains
+student@stanford.edu
+professor@mit.edu
+admin@harvard.edu
+research@berkeley.edu
+faculty@yale.edu
+
+# International domains
+contact@company.co.uk
+sales@business.de
+info@enterprise.fr
+support@firm.ca
+team@startup.au
+
+# Free provider variations
+user@mail.com
+contact@gmx.com
+business@zoho.com
+team@fastmail.com
+project@yandex.com
+
+# Potential catch-all with good patterns
+john.anderson@techcorp.com
+sarah.miller@consulting.com
+michael.brown@marketing.io
+emily.davis@creative.co
+david.wilson@agency.com
+
+# Additional corporate
+cfo@finance.com
+cto@technology.com
+vp@operations.com
+director@strategy.com
+manager@logistics.com

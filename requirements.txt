@@ -8,3 +8,6 @@ fastapi>=0.110
 uvicorn>=0.29
 tqdm>=4.66
 slowapi>=0.1
+streamlit>=1.31
+pandas>=2.0
+requests>=2.31
