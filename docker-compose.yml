@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  kadenverify:
+    build: .
+    container_name: kadenverify
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+    environment:
+      - KADENVERIFY_API_KEY=${KADENVERIFY_API_KEY:-}
+      - KADENVERIFY_HELO_DOMAIN=${KADENVERIFY_HELO_DOMAIN:-verify.kadenwood.com}
+      - KADENVERIFY_FROM_ADDRESS=${KADENVERIFY_FROM_ADDRESS:-verify@kadenwood.com}
+      - KADENVERIFY_CONCURRENCY=${KADENVERIFY_CONCURRENCY:-5}
+    volumes:
+      - ./verified.duckdb:/app/verified.duckdb
+      - ./lists:/app/lists
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8025/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

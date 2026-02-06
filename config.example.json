@@ -1,0 +1,42 @@
+{
+  "smtp": {
+    "helo_domain": "verify.yourdomain.com",
+    "from_address": "verify@yourdomain.com",
+    "default_concurrency": 20,
+    "connect_timeout": 5,
+    "command_timeout": 5,
+    "total_timeout": 20
+  },
+  "api": {
+    "host": "0.0.0.0",
+    "port": 8025,
+    "api_key": "your-secret-api-key-here"
+  },
+  "cache": {
+    "verified_db_path": "./verified.duckdb",
+    "dns_ttl_hours": 24,
+    "catchall_ttl_days": 7,
+    "cache_ttl_days": 30
+  },
+  "tiered_verification": {
+    "enabled": true,
+    "fast_tier_confidence_threshold": 0.85
+  },
+  "catchall_validation": {
+    "enabled": true,
+    "apollo_db_path": null,
+    "check_local_databases": true,
+    "pattern_matching": true,
+    "name_validation": true,
+    "company_heuristics": true
+  },
+  "external_apis": {
+    "apollo_api_key": null,
+    "linkedin_api_key": null
+  },
+  "rate_limiting": {
+    "enabled": true,
+    "window_seconds": 60,
+    "max_requests": 100
+  }
+}

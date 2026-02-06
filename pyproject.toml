@@ -1,0 +1,20 @@
+[project]
+name = "kadenverify"
+version = "0.1.0"
+description = "Self-hosted email verification engine"
+requires-python = ">=3.12"
+dependencies = [
+    "dnspython>=2.6",
+    "aiosmtplib>=3.0",
+    "aiodns>=3.2",
+    "click>=8.1",
+    "pydantic>=2.6",
+    "duckdb>=1.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "tqdm>=4.66",
+    "slowapi>=0.1",
+]
+
+[project.scripts]
+kadenverify = "cli:main"

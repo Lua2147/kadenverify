@@ -1,0 +1,325 @@
+"""KadenVerify CLI — email verification from the command line.
+
+Commands:
+  verify       Verify a single email address
+  verify-file  Verify emails from a text file
+  pipeline     Run batch verification against a DuckDB source
+  stats        Show verification statistics from verified.duckdb
+"""
+
+import asyncio
+import json
+import logging
+import sys
+from pathlib import Path
+
+import click
+from tqdm import tqdm
+
+# Ensure the project root is on the path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from engine.verifier import verify_email, verify_batch
+from engine.models import Reachability
+
+
+def _setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+@click.group()
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
+def main(verbose: bool):
+    """KadenVerify — self-hosted email verification engine."""
+    _setup_logging(verbose)
+
+
+@main.command()
+@click.argument("email")
+@click.option("--helo", default="verify.kadenwood.com", help="EHLO domain")
+@click.option("--from-addr", default="verify@kadenwood.com", help="MAIL FROM address")
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+def verify(email: str, helo: str, from_addr: str, json_output: bool):
+    """Verify a single email address."""
+    result = asyncio.run(verify_email(email, helo_domain=helo, from_address=from_addr))
+
+    if json_output:
+        click.echo(json.dumps(result.to_omniverifier(), indent=2))
+    else:
+        _print_result(result)
+
+
+@main.command("verify-file")
+@click.argument("filepath", type=click.Path(exists=True))
+@click.option("--output", "-o", type=click.Path(), help="Output file path")
+@click.option("--format", "fmt", type=click.Choice(["json", "csv", "text"]), default="text")
+@click.option("--concurrency", "-c", default=5, help="Max concurrent SMTP connections")
+@click.option("--helo", default="verify.kadenwood.com", help="EHLO domain")
+@click.option("--from-addr", default="verify@kadenwood.com", help="MAIL FROM address")
+def verify_file(filepath: str, output: str, fmt: str, concurrency: int, helo: str, from_addr: str):
+    """Verify emails from a text file (one email per line)."""
+    emails = _read_email_file(filepath)
+    if not emails:
+        click.echo("No emails found in file.")
+        return
+
+    click.echo(f"Verifying {len(emails)} emails (concurrency={concurrency})...")
+
+    pbar = tqdm(total=len(emails), desc="Verifying", unit="email")
+
+    def on_progress(result):
+        pbar.update(1)
+
+    results = asyncio.run(
+        verify_batch(
+            emails,
+            concurrency=concurrency,
+            helo_domain=helo,
+            from_address=from_addr,
+            progress_callback=on_progress,
+        )
+    )
+    pbar.close()
+
+    _output_results(results, output, fmt)
+    _print_summary(results)
+
+
+@main.command()
+@click.option("--source", required=True, help="Source DuckDB name (e.g., 'qualified', 'apollo')")
+@click.option("--source-path", type=click.Path(), help="Full path to source .duckdb file")
+@click.option("--table", default="contacts", help="Table name in source DB")
+@click.option("--email-column", default="email", help="Email column name")
+@click.option("--verified-db", type=click.Path(), help="Path to verified.duckdb")
+@click.option("--concurrency", "-c", default=5, help="Max concurrent SMTP connections")
+@click.option("--limit", type=int, help="Max emails to verify")
+@click.option("--helo", default="verify.kadenwood.com", help="EHLO domain")
+@click.option("--from-addr", default="verify@kadenwood.com", help="MAIL FROM address")
+def pipeline(
+    source: str,
+    source_path: str,
+    table: str,
+    email_column: str,
+    verified_db: str,
+    concurrency: int,
+    limit: int,
+    helo: str,
+    from_addr: str,
+):
+    """Run batch verification against a DuckDB source.
+
+    Reads emails from a people-warehouse DuckDB database, verifies them,
+    and writes results to verified.duckdb. Incremental: skips already-verified emails.
+    """
+    from store.duckdb_io import (
+        init_verified_db,
+        read_emails_from_source,
+        write_results_batch,
+        get_stats,
+    )
+
+    # Resolve paths
+    if source_path:
+        src = Path(source_path)
+    else:
+        # Look for source in standard locations
+        candidates = [
+            Path(__file__).parent / f"{source}.duckdb",
+            Path(__file__).parent.parent / "people-warehouse" / "etl" / f"{source}.duckdb",
+        ]
+        src = next((p for p in candidates if p.exists()), None)
+        if src is None:
+            click.echo(f"Could not find {source}.duckdb. Use --source-path to specify.")
+            sys.exit(1)
+
+    verified_path = Path(verified_db) if verified_db else None
+
+    # Initialize verified DB
+    vconn = init_verified_db(verified_path)
+    verified_path = verified_path or Path(__file__).parent / "verified.duckdb"
+
+    # Read emails (excluding already verified)
+    click.echo(f"Reading emails from {src}...")
+    emails = read_emails_from_source(
+        source_path=src,
+        table=table,
+        email_column=email_column,
+        limit=limit,
+        exclude_verified_db=verified_path,
+    )
+
+    if not emails:
+        click.echo("No new emails to verify.")
+        stats = get_stats(vconn)
+        click.echo(f"Total verified: {stats['total']}")
+        vconn.close()
+        return
+
+    click.echo(f"Verifying {len(emails)} emails (concurrency={concurrency})...")
+
+    pbar = tqdm(total=len(emails), desc="Verifying", unit="email")
+    batch_buffer: list = []
+    WRITE_BATCH_SIZE = 100
+
+    def on_progress(result):
+        pbar.update(1)
+        batch_buffer.append(result)
+        # Write in batches for performance
+        if len(batch_buffer) >= WRITE_BATCH_SIZE:
+            write_results_batch(vconn, batch_buffer)
+            batch_buffer.clear()
+
+    results = asyncio.run(
+        verify_batch(
+            emails,
+            concurrency=concurrency,
+            helo_domain=helo,
+            from_address=from_addr,
+            progress_callback=on_progress,
+        )
+    )
+    pbar.close()
+
+    # Write remaining buffer
+    if batch_buffer:
+        write_results_batch(vconn, batch_buffer)
+        batch_buffer.clear()
+
+    # Print stats
+    stats = get_stats(vconn)
+    click.echo(f"\nTotal verified: {stats['total']}")
+    for reach, count in stats.get("by_reachability", {}).items():
+        click.echo(f"  {reach}: {count}")
+    click.echo(f"  catch-all domains: {stats.get('catch_all', 0)}")
+    click.echo(f"  disposable: {stats.get('disposable', 0)}")
+
+    vconn.close()
+
+
+@main.command()
+@click.option("--verified-db", type=click.Path(), help="Path to verified.duckdb")
+def stats(verified_db: str):
+    """Show verification statistics from verified.duckdb."""
+    from store.duckdb_io import init_verified_db, get_stats
+
+    verified_path = Path(verified_db) if verified_db else None
+    conn = init_verified_db(verified_path)
+    s = get_stats(conn)
+
+    click.echo(f"Total verified emails: {s['total']}")
+    click.echo("\nBy reachability:")
+    for reach, count in s.get("by_reachability", {}).items():
+        pct = (count / s["total"] * 100) if s["total"] > 0 else 0
+        click.echo(f"  {reach}: {count} ({pct:.1f}%)")
+
+    click.echo(f"\nCatch-all domains: {s.get('catch_all', 0)}")
+    click.echo(f"Disposable: {s.get('disposable', 0)}")
+
+    if s.get("top_domains"):
+        click.echo("\nTop 20 domains:")
+        for d in s["top_domains"]:
+            click.echo(f"  {d['domain']}: {d['count']}")
+
+    conn.close()
+
+
+def _read_email_file(filepath: str) -> list[str]:
+    """Read emails from a text file (one per line)."""
+    with open(filepath) as f:
+        return [
+            line.strip()
+            for line in f
+            if line.strip() and not line.startswith("#") and "@" in line
+        ]
+
+
+def _print_result(result):
+    """Pretty-print a single verification result."""
+    icon = {
+        Reachability.safe: "✓",
+        Reachability.risky: "~",
+        Reachability.invalid: "✗",
+        Reachability.unknown: "?",
+    }.get(result.reachability, "?")
+
+    click.echo(f"\n{icon} {result.email}")
+    click.echo(f"  Reachability: {result.reachability.value}")
+    click.echo(f"  Deliverable:  {result.is_deliverable}")
+    click.echo(f"  Provider:     {result.provider.value}")
+    click.echo(f"  MX Host:      {result.mx_host}")
+    click.echo(f"  SMTP Code:    {result.smtp_code}")
+
+    flags = []
+    if result.is_catch_all:
+        flags.append("catch-all")
+    if result.is_disposable:
+        flags.append("disposable")
+    if result.is_role:
+        flags.append("role")
+    if result.is_free:
+        flags.append("free")
+    if flags:
+        click.echo(f"  Flags:        {', '.join(flags)}")
+    if result.error:
+        click.echo(f"  Error:        {result.error}")
+
+
+def _output_results(results, output_path, fmt):
+    """Write results to a file or stdout."""
+    if fmt == "json":
+        data = [r.to_omniverifier() for r in results]
+        text = json.dumps(data, indent=2)
+    elif fmt == "csv":
+        import csv
+        import io
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "email", "status", "reachability", "deliverable", "catch_all",
+            "disposable", "role", "free", "provider", "mx_host", "smtp_code",
+        ])
+        for r in results:
+            writer.writerow([
+                r.email, r.to_omniverifier()["status"], r.reachability.value,
+                r.is_deliverable, r.is_catch_all, r.is_disposable,
+                r.is_role, r.is_free, r.provider.value, r.mx_host, r.smtp_code,
+            ])
+        text = buf.getvalue()
+    else:
+        lines = []
+        for r in results:
+            icon = {"safe": "✓", "risky": "~", "invalid": "✗", "unknown": "?"}.get(
+                r.reachability.value, "?"
+            )
+            lines.append(f"{icon} {r.email} [{r.reachability.value}]")
+        text = "\n".join(lines)
+
+    if output_path:
+        with open(output_path, "w") as f:
+            f.write(text)
+        click.echo(f"Results written to {output_path}")
+    else:
+        click.echo(text)
+
+
+def _print_summary(results):
+    """Print a summary of batch verification results."""
+    total = len(results)
+    counts = {}
+    for r in results:
+        counts[r.reachability.value] = counts.get(r.reachability.value, 0) + 1
+
+    click.echo(f"\nSummary ({total} emails):")
+    for reach in ["safe", "risky", "invalid", "unknown"]:
+        count = counts.get(reach, 0)
+        pct = (count / total * 100) if total > 0 else 0
+        click.echo(f"  {reach}: {count} ({pct:.1f}%)")
+
+
+if __name__ == "__main__":
+    main()

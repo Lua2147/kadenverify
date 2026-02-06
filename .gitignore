@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Databases (don't commit verification results)
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Output files
+output/
+results/
+*.csv
+
+# API keys and secrets
+config.json
+config/api_keys.json
+secrets.json
+*.secret.json
+
+# But allow example configs
+!config.example.json
+!**/config.example.json
+
+# Test data (optional - can commit sample data)
+# test_data/
+
+# Coverage reports
+.coverage
+htmlcov/
+.pytest_cache/
