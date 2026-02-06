@@ -18,8 +18,8 @@ from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration
-API_URL = "http://localhost:8025"
-API_KEY = st.secrets.get("KADENVERIFY_API_KEY", "your-api-key-here")
+API_URL = "http://198.23.249.137:8025"  # RackNerd server with port 25 open
+API_KEY = st.secrets.get("KADENVERIFY_API_KEY", "131245c8cc9ac8ae3d69f3a7f7e85164a29c08403483aa7b2f3608f53e5765a6")
 
 # Create a session for connection pooling
 SESSION = requests.Session()
@@ -237,15 +237,10 @@ def main():
                         st.info(f"Showing first 10 of {len(emails)} emails")
 
                 # Verify button
-                col1, col2, col3 = st.columns([1, 1, 2])
-                with col1:
-                    verify_button = st.button("🚀 Verify All", type="primary", use_container_width=True)
-                with col2:
-                    limit = st.number_input("Limit", min_value=1, max_value=len(emails),
-                                           value=min(100, len(emails)))
+                verify_button = st.button("🚀 Verify All", type="primary", use_container_width=True)
 
                 if verify_button:
-                    emails_to_verify = emails[:limit]
+                    emails_to_verify = emails
 
                     st.subheader("⚡ Verification in Progress")
                     progress_bar = st.progress(0)
