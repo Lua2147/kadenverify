@@ -67,7 +67,7 @@ def verify_email(email: str) -> Dict:
         response = SESSION.get(
             f"{API_URL}/verify",
             params={"email": email},
-            timeout=30
+            timeout=120  # Increased for slow SMTP servers
         )
         if response.status_code == 200:
             return response.json()
@@ -85,7 +85,7 @@ def verify_email(email: str) -> Dict:
         }
 
 
-def verify_batch(emails: List[str], progress_callback=None, max_workers=20) -> List[Dict]:
+def verify_batch(emails: List[str], progress_callback=None, max_workers=10) -> List[Dict]:
     """Verify multiple emails with concurrent processing and progress tracking."""
     results = []
     total = len(emails)
