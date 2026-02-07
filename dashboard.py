@@ -186,6 +186,37 @@ def parse_uploaded_file(uploaded_file) -> List[str]:
     return emails
 
 
+def calculate_tier_stats(results: List[Dict]) -> Dict:
+    """Calculate tier distribution and cost statistics."""
+    tier_counts = {}
+    enrichment_count = 0
+    total_cost = 0.0
+
+    for result in results:
+        tier = result.get('_kadenverify_tier', 'unknown')
+        reason = result.get('_kadenverify_reason', '')
+
+        # Count by tier
+        tier_key = f"Tier {tier}"
+        tier_counts[tier_key] = tier_counts.get(tier_key, 0) + 1
+
+        # Count enrichment and calculate cost
+        if 'tier5' in reason or 'tier6' in reason:
+            enrichment_count += 1
+            if 'exa' in reason:
+                total_cost += 0.0005
+            if 'apollo' in reason:
+                total_cost += 0.10
+
+    return {
+        'tier_counts': tier_counts,
+        'enrichment_count': enrichment_count,
+        'total_cost': total_cost,
+        'cost_per_email': total_cost / len(results) if results else 0,
+        'enrichment_rate': enrichment_count / len(results) if results else 0
+    }
+
+
 def results_to_dataframe(results: List[Dict]) -> pd.DataFrame:
     """Convert results to pandas DataFrame."""
     if not results:
@@ -194,9 +225,10 @@ def results_to_dataframe(results: List[Dict]) -> pd.DataFrame:
     df = pd.DataFrame(results)
 
     # Reorder columns for better display
-    priority_cols = ['email', 'status', 'reachability', 'is_deliverable',
-                     'is_catchall', 'catchall_confidence', 'is_disposable',
-                     'is_role', 'provider', 'mx_host']
+    priority_cols = ['email', 'status', '_kadenverify_tier', '_kadenverify_reason',
+                     'reachability', 'is_deliverable', 'is_catchall',
+                     'catchall_confidence', 'is_disposable', 'is_role',
+                     'provider', 'mx_host']
 
     cols = [col for col in priority_cols if col in df.columns]
     cols += [col for col in df.columns if col not in cols]
@@ -246,19 +278,21 @@ def main():
         # Help
         st.subheader("ℹ️ About")
         st.markdown("""
-        **KadenVerify** verifies emails using:
-        - SMTP handshake (with retry)
-        - DNS MX lookup
-        - Catch-all detection
-        - Pattern matching
+        **KadenVerify** uses a 6-tier pipeline:
+        - **Tier 1:** Cache (<50ms) - FREE
+        - **Tier 2:** Fast validation (DNS) - FREE
+        - **Tier 3:** SMTP verification - FREE
+        - **Tier 4:** Pattern matching - FREE
+        - **Tier 5:** Enrichment (Exa/Apollo) - $0.0005-$0.10
+        - **Tier 6:** SMTP re-verification - FREE
 
         **Status meanings:**
         - ✅ **valid** - Safe to send
         - ⚠️ **risky** - Send with caution
         - ❌ **invalid** - Will bounce
 
-        **Note:** Unknowns are automatically
-        retried and marked as risky.
+        **Cost:** ~$7 per 1000 emails
+        (93% cheaper than pure Apollo!)
         """)
 
     # Main content
@@ -322,7 +356,9 @@ def main():
                     # Show summary
                     st.subheader("📊 Summary")
                     df = results_to_dataframe(results)
+                    tier_stats = calculate_tier_stats(results)
 
+                    # Status distribution
                     col1, col2, col3, col4 = st.columns(4)
 
                     safe_count = len(df[df['status'] == 'valid'])
@@ -364,8 +400,48 @@ def main():
 
                     st.divider()
 
+                    # Tier distribution and cost
+                    st.subheader("💰 Cost & Efficiency")
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        st.metric("Total Cost", f"${tier_stats['total_cost']:.2f}")
+                        st.caption(f"${tier_stats['cost_per_email']:.4f} per email")
+
+                    with col2:
+                        st.metric("Enriched", f"{tier_stats['enrichment_count']}")
+                        st.caption(f"{tier_stats['enrichment_rate']:.1%} needed Tier 5")
+
+                    with col3:
+                        projected_1000 = tier_stats['cost_per_email'] * 1000
+                        st.metric("Projected 1000", f"${projected_1000:.2f}")
+                        st.caption(f"vs ${100:.2f} Apollo (${100 - projected_1000:.2f} saved)")
+
+                    # Tier distribution chart
+                    with st.expander("📊 Tier Distribution", expanded=False):
+                        tier_df = pd.DataFrame([
+                            {"Tier": k, "Count": v, "Percentage": f"{(v/len(results)*100):.1f}%"}
+                            for k, v in sorted(tier_stats['tier_counts'].items())
+                        ])
+                        st.dataframe(tier_df, use_container_width=True, hide_index=True)
+
+                        # Show what each tier means
+                        st.caption("""
+                        **Tier 1:** Cache • **Tier 2:** Fast DNS • **Tier 3:** SMTP
+                        • **Tier 4:** Pattern • **Tier 5:** Enrichment (paid) • **Tier 6:** SMTP Loop
+                        """)
+
+                    st.divider()
+
                     # Show results table
                     st.subheader("📋 Results")
+
+                    # Add enrichment indicator column
+                    if '_kadenverify_reason' in df.columns:
+                        df['enriched'] = df['_kadenverify_reason'].apply(
+                            lambda x: '🎉' if ('tier5' in str(x) or 'tier6' in str(x)) else ''
+                        )
+
                     st.dataframe(df, use_container_width=True, height=400)
 
                     # Download button
@@ -391,9 +467,15 @@ def main():
 
                 # Display result
                 status = result.get('status', 'risky')
+                tier = result.get('_kadenverify_tier', '?')
+                reason = result.get('_kadenverify_reason', '')
+
+                # Check if enriched
+                is_enriched = 'tier5' in reason or 'tier6' in reason
+                enrichment_badge = " 🎉 **ENRICHED**" if is_enriched else ""
 
                 if status == 'valid':
-                    st.success("✅ Email is valid and deliverable!")
+                    st.success(f"✅ Email is valid and deliverable!{enrichment_badge}")
                 elif status in ['catch_all', 'risky', 'unknown']:
                     st.warning("⚠️ Email is risky - send with caution")
                     if 'risk_reason' in result:
@@ -403,6 +485,18 @@ def main():
                 else:
                     st.error(f"⚠️ Error: {result.get('error', 'Verification failed')}")
 
+                # Show tier and cost
+                cost = 0.0
+                if 'exa' in reason:
+                    cost += 0.0005
+                if 'apollo' in reason:
+                    cost += 0.10
+
+                if cost > 0:
+                    st.info(f"🏷️ Tier {tier} • Cost: ${cost:.4f}")
+                else:
+                    st.info(f"🏷️ Tier {tier} • FREE verification")
+
                 # Show details
                 with st.expander("📋 Details", expanded=True):
                     col1, col2 = st.columns(2)
@@ -411,6 +505,7 @@ def main():
                         st.write("**Basic Info**")
                         st.write(f"Email: `{result.get('email')}`")
                         st.write(f"Status: `{result.get('status')}`")
+                        st.write(f"Tier: `{tier}`")
                         st.write(f"Provider: `{result.get('provider', 'N/A')}`")
                         st.write(f"MX Host: `{result.get('mx_host', 'N/A')}`")
 
@@ -420,6 +515,8 @@ def main():
                         st.write(f"Catch-all: {'⚠️' if result.get('is_catchall') else '✅'}")
                         st.write(f"Disposable: {'⚠️' if result.get('is_disposable') else '✅'}")
                         st.write(f"Role account: {'⚠️' if result.get('is_role') else '✅'}")
+                        if is_enriched:
+                            st.write(f"Enriched: 🎉 Yes")
 
                 # Show JSON
                 with st.expander("🔧 Raw JSON Response"):
@@ -434,10 +531,17 @@ def main():
         if 'results' in st.session_state:
             results = st.session_state['results']
             duration = st.session_state.get('verification_time', 0)
+            tier_stats = calculate_tier_stats(results)
 
-            st.info(f"Last verification: {len(results)} emails in {duration:.1f}s")
+            st.info(f"Last verification: {len(results)} emails in {duration:.1f}s • Cost: ${tier_stats['total_cost']:.2f}")
 
             df = results_to_dataframe(results)
+
+            # Add enrichment indicator
+            if '_kadenverify_reason' in df.columns:
+                df['enriched'] = df['_kadenverify_reason'].apply(
+                    lambda x: '🎉' if ('tier5' in str(x) or 'tier6' in str(x)) else ''
+                )
 
             # Filters
             col1, col2, col3 = st.columns(3)
