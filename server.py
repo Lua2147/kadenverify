@@ -155,11 +155,11 @@ def _cache_update(result: VerificationResult):
         # Explicitly commit the transaction
         db.commit()
 
-        # Checkpoint WAL every 100 updates to keep WAL file size manageable
+        # Checkpoint every 100 updates to keep WAL file size manageable
         _cache_update_count += 1
         if _cache_update_count % 100 == 0:
-            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            logger.info(f"Checkpointed WAL after {_cache_update_count} updates")
+            db.execute("CHECKPOINT")
+            logger.info(f"Checkpointed database after {_cache_update_count} updates")
     except Exception as e:
         logger.error(f"Cache update error for {result.email}: {e}")
 
