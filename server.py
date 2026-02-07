@@ -123,8 +123,11 @@ def _cache_lookup(email: str) -> Optional[VerificationResult]:
         return None
 
 
+_cache_update_count = 0
+
 def _cache_update(result: VerificationResult):
     """Update cache with verification result."""
+    global _cache_update_count
     try:
         db = _get_cache_db()
         if not db:
@@ -149,6 +152,14 @@ def _cache_update(result: VerificationResult):
             result.verified_at,
             result.error,
         ])
+        # Explicitly commit the transaction
+        db.commit()
+
+        # Checkpoint WAL every 100 updates to keep WAL file size manageable
+        _cache_update_count += 1
+        if _cache_update_count % 100 == 0:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            logger.info(f"Checkpointed WAL after {_cache_update_count} updates")
     except Exception as e:
         logger.error(f"Cache update error for {result.email}: {e}")
 
