@@ -296,7 +296,7 @@ def main():
         """)
 
     # Main content
-    tab1, tab2, tab3 = st.tabs(["📁 Upload & Verify", "⚡ Single Email", "📊 Batch Results"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📁 Upload & Verify", "⚡ Single Email", "📊 Batch Results", "💾 Database Results"])
 
     # Tab 1: File Upload
     with tab1:
@@ -578,6 +578,198 @@ def main():
             )
         else:
             st.info("No verification results yet. Upload a file in the 'Upload & Verify' tab.")
+
+    # Tab 4: Database Results
+    with tab4:
+        st.header("💾 Database Results - All Verifications")
+
+        try:
+            import duckdb
+            from pathlib import Path
+
+            # Connect to database
+            db_path = Path(__file__).parent / "verified.duckdb"
+
+            if not db_path.exists():
+                st.warning("No database found. Run some verifications first!")
+            else:
+                conn = duckdb.connect(str(db_path), read_only=True)
+
+                # Get total count
+                total = conn.execute("SELECT COUNT(*) FROM verified_emails").fetchone()[0]
+
+                if total == 0:
+                    st.info("Database is empty. Run some verifications to populate it!")
+                else:
+                    st.success(f"📊 **{total:,} emails** verified in database")
+
+                    # Date range
+                    date_range = conn.execute("""
+                        SELECT
+                            MIN(verified_at) as first_verification,
+                            MAX(verified_at) as last_verification
+                        FROM verified_emails
+                    """).fetchone()
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("First Verification", str(date_range[0])[:19] if date_range[0] else "N/A")
+                    with col2:
+                        st.metric("Last Verification", str(date_range[1])[:19] if date_range[1] else "N/A")
+
+                    st.divider()
+
+                    # Summary stats
+                    st.subheader("📈 Summary Statistics")
+
+                    stats_df = conn.execute("""
+                        SELECT
+                            reachability,
+                            COUNT(*) as count,
+                            ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) as percentage
+                        FROM verified_emails
+                        GROUP BY reachability
+                        ORDER BY count DESC
+                    """).df()
+
+                    # Display as columns
+                    cols = st.columns(len(stats_df))
+                    for idx, row in stats_df.iterrows():
+                        with cols[idx]:
+                            status = row['reachability']
+                            count = row['count']
+                            pct = row['percentage']
+
+                            # Color based on status
+                            if status == 'safe':
+                                color = "#10b981"
+                            elif status == 'risky':
+                                color = "#f59e0b"
+                            elif status == 'invalid':
+                                color = "#dc2626"
+                            else:
+                                color = "#64748b"
+
+                            st.markdown(f"""
+                            <div class="stat-box" style="background: {color};">
+                                <div class="stat-number">{count}</div>
+                                <div class="stat-label">{status.upper()} ({pct}%)</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    st.divider()
+
+                    # Filters
+                    st.subheader("🔍 Filters")
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        status_filter_db = st.multiselect(
+                            "Status",
+                            options=['safe', 'risky', 'invalid', 'unknown'],
+                            default=[],
+                            key="db_status_filter"
+                        )
+
+                    with col2:
+                        # Get unique providers
+                        providers = conn.execute("""
+                            SELECT DISTINCT provider
+                            FROM verified_emails
+                            WHERE provider IS NOT NULL
+                            ORDER BY provider
+                        """).df()['provider'].tolist()
+
+                        provider_filter_db = st.multiselect(
+                            "Provider",
+                            options=providers,
+                            default=[],
+                            key="db_provider_filter"
+                        )
+
+                    with col3:
+                        # Date filter
+                        days_back = st.selectbox(
+                            "Time Period",
+                            options=[("All Time", 9999), ("Last 24 Hours", 1), ("Last 7 Days", 7), ("Last 30 Days", 30)],
+                            format_func=lambda x: x[0],
+                            key="db_date_filter"
+                        )
+
+                    # Build query
+                    query = "SELECT * FROM verified_emails WHERE 1=1"
+
+                    if status_filter_db:
+                        status_list = "', '".join(status_filter_db)
+                        query += f" AND reachability IN ('{status_list}')"
+
+                    if provider_filter_db:
+                        provider_list = "', '".join(provider_filter_db)
+                        query += f" AND provider IN ('{provider_list}')"
+
+                    if days_back[1] < 9999:
+                        query += f" AND verified_at > NOW() - INTERVAL '{days_back[1]} days'"
+
+                    query += " ORDER BY verified_at DESC LIMIT 10000"
+
+                    # Load results
+                    results_df = conn.execute(query).df()
+
+                    st.subheader(f"📋 Results ({len(results_df):,} emails)")
+
+                    # Show data
+                    st.dataframe(
+                        results_df,
+                        use_container_width=True,
+                        height=500,
+                        column_config={
+                            "verified_at": st.column_config.DatetimeColumn(
+                                "Verified At",
+                                format="YYYY-MM-DD HH:mm:ss"
+                            ),
+                            "is_deliverable": st.column_config.CheckboxColumn("Deliverable"),
+                            "is_catch_all": st.column_config.CheckboxColumn("Catch-all"),
+                            "is_disposable": st.column_config.CheckboxColumn("Disposable"),
+                            "is_role": st.column_config.CheckboxColumn("Role"),
+                            "is_free": st.column_config.CheckboxColumn("Free"),
+                        }
+                    )
+
+                    # Download button
+                    csv = results_df.to_csv(index=False)
+                    st.download_button(
+                        label=f"💾 Download {len(results_df):,} Results (CSV)",
+                        data=csv,
+                        file_name=f"kadenverify_database_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                    # Provider breakdown
+                    with st.expander("📊 Provider Breakdown"):
+                        provider_stats = conn.execute("""
+                            SELECT
+                                provider,
+                                COUNT(*) as total,
+                                SUM(CASE WHEN is_deliverable THEN 1 ELSE 0 END) as deliverable,
+                                ROUND(AVG(CASE WHEN is_deliverable THEN 100.0 ELSE 0.0 END), 1) as deliverable_rate
+                            FROM verified_emails
+                            WHERE provider IS NOT NULL
+                            GROUP BY provider
+                            ORDER BY total DESC
+                            LIMIT 20
+                        """).df()
+
+                        st.dataframe(provider_stats, use_container_width=True, hide_index=True)
+
+                conn.close()
+
+        except ImportError:
+            st.error("DuckDB not installed. Run: pip install duckdb")
+        except Exception as e:
+            st.error(f"Database error: {e}")
+            st.exception(e)
 
 
 if __name__ == "__main__":
