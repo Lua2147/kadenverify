@@ -93,6 +93,7 @@ async def verify_email_tiered(
                 email=email,
                 exa_api_key=EXA_API_KEY,
                 apollo_api_key=APOLLO_API_KEY,
+                is_catchall=result.is_catch_all or False,
             )
 
             # Update result
