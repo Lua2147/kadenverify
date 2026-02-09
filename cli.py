@@ -5,6 +5,7 @@ Commands:
   verify-file  Verify emails from a text file
   pipeline     Run batch verification against a DuckDB source
   stats        Show verification statistics from verified.duckdb
+  migrate-duckdb-to-supabase  Upload verified_emails from DuckDB into Supabase
 """
 
 import asyncio
@@ -20,7 +21,9 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 
 from engine.verifier import verify_email, verify_batch
+from engine.tiered_verifier import _tier1_cached
 from engine.models import Reachability
+from store.supabase_io import supabase_client_from_env
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -137,13 +140,94 @@ def pipeline(
             click.echo(f"Could not find {source}.duckdb. Use --source-path to specify.")
             sys.exit(1)
 
+    supa = supabase_client_from_env()
+    if supa is not None:
+        click.echo(f"Reading emails from {src}...")
+        emails = read_emails_from_source(
+            source_path=src,
+            table=table,
+            email_column=email_column,
+            limit=limit,
+            exclude_verified_db=None,
+        )
+
+        if not emails:
+            click.echo("No emails to verify.")
+            stats = supa.get_stats()
+            click.echo(f"Total verified: {stats['total']}")
+            return
+
+        click.echo(f"Verifying {len(emails)} emails (concurrency={concurrency}) using Supabase store...")
+        pbar = tqdm(total=len(emails), desc="Verifying", unit="email")
+
+        async def cache_lookup(email: str):
+            return await asyncio.to_thread(supa.get_by_email, email)
+
+        async def upsert_result(result):
+            await asyncio.to_thread(supa.upsert_result, result)
+
+        async def verify_one(email: str):
+            cached = await _tier1_cached(email, cache_lookup)
+            if cached is not None:
+                return cached
+            try:
+                return await verify_email(email, helo_domain=helo, from_address=from_addr)
+            except Exception:
+                logging.getLogger("kadenverify.cli").exception("Verification failed for %s", email)
+                from engine.models import VerificationResult as _VR
+
+                return _VR(
+                    email=email,
+                    normalized=email.strip().lower(),
+                    reachability=Reachability.unknown,
+                    is_deliverable=None,
+                    domain=email.split("@")[-1] if "@" in email else "",
+                    error="internal verification error",
+                )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for email in emails:
+            queue.put_nowait(email)
+        for _ in range(max(1, concurrency)):
+            queue.put_nowait(None)
+
+        results: list = []
+
+        async def worker():
+            while True:
+                email = await queue.get()
+                if email is None:
+                    queue.task_done()
+                    break
+                result = await verify_one(email)
+                await upsert_result(result)
+                results.append(result)
+                pbar.update(1)
+                queue.task_done()
+
+        async def run():
+            workers = [asyncio.create_task(worker()) for _ in range(max(1, concurrency))]
+            await queue.join()
+            await asyncio.gather(*workers)
+            return results
+
+        results = asyncio.run(run())
+        pbar.close()
+
+        stats = supa.get_stats()
+        click.echo(f"\nTotal verified: {stats['total']}")
+        for reach, count in stats.get("by_reachability", {}).items():
+            click.echo(f"  {reach}: {count}")
+        click.echo(f"  catch-all domains: {stats.get('catch_all', 0)}")
+        click.echo(f"  disposable: {stats.get('disposable', 0)}")
+        return
+
+    # DuckDB-backed pipeline (legacy)
     verified_path = Path(verified_db) if verified_db else None
 
-    # Initialize verified DB
     vconn = init_verified_db(verified_path)
     verified_path = verified_path or Path(__file__).parent / "verified.duckdb"
 
-    # Read emails (excluding already verified)
     click.echo(f"Reading emails from {src}...")
     emails = read_emails_from_source(
         source_path=src,
@@ -169,7 +253,6 @@ def pipeline(
     def on_progress(result):
         pbar.update(1)
         batch_buffer.append(result)
-        # Write in batches for performance
         if len(batch_buffer) >= WRITE_BATCH_SIZE:
             write_results_batch(vconn, batch_buffer)
             batch_buffer.clear()
@@ -185,12 +268,10 @@ def pipeline(
     )
     pbar.close()
 
-    # Write remaining buffer
     if batch_buffer:
         write_results_batch(vconn, batch_buffer)
         batch_buffer.clear()
 
-    # Print stats
     stats = get_stats(vconn)
     click.echo(f"\nTotal verified: {stats['total']}")
     for reach, count in stats.get("by_reachability", {}).items():
@@ -204,12 +285,17 @@ def pipeline(
 @main.command()
 @click.option("--verified-db", type=click.Path(), help="Path to verified.duckdb")
 def stats(verified_db: str):
-    """Show verification statistics from verified.duckdb."""
-    from store.duckdb_io import init_verified_db, get_stats
+    """Show verification statistics from the configured store backend."""
+    supa = supabase_client_from_env()
+    if supa is not None:
+        s = supa.get_stats()
+        conn = None
+    else:
+        from store.duckdb_io import init_verified_db, get_stats
 
-    verified_path = Path(verified_db) if verified_db else None
-    conn = init_verified_db(verified_path)
-    s = get_stats(conn)
+        verified_path = Path(verified_db) if verified_db else None
+        conn = init_verified_db(verified_path)
+        s = get_stats(conn)
 
     click.echo(f"Total verified emails: {s['total']}")
     click.echo("\nBy reachability:")
@@ -225,7 +311,97 @@ def stats(verified_db: str):
         for d in s["top_domains"]:
             click.echo(f"  {d['domain']}: {d['count']}")
 
-    conn.close()
+    if conn is not None:
+        conn.close()
+
+
+@main.command("migrate-duckdb-to-supabase")
+@click.option(
+    "--duckdb-path",
+    type=click.Path(exists=True),
+    default=str(Path(__file__).parent / "verified.duckdb"),
+    show_default=True,
+    help="Path to the DuckDB file containing verified_emails.",
+)
+@click.option("--batch-size", type=int, default=500, show_default=True)
+@click.option("--limit", type=int, default=None, help="Max rows to migrate (for testing).")
+def migrate_duckdb_to_supabase(duckdb_path: str, batch_size: int, limit: int):
+    """Migrate verified_emails rows from DuckDB into Supabase (upsert by email)."""
+    supa = supabase_client_from_env()
+    if supa is None:
+        click.echo(
+            "Supabase not configured. Set KADENVERIFY_SUPABASE_URL and "
+            "KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY."
+        )
+        sys.exit(1)
+
+    import duckdb
+    from datetime import datetime, timezone
+
+    conn = duckdb.connect(str(duckdb_path), read_only=True)
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info('verified_emails')").fetchall()]
+        expected = [
+            "email",
+            "normalized",
+            "reachability",
+            "is_deliverable",
+            "is_catch_all",
+            "is_disposable",
+            "is_role",
+            "is_free",
+            "mx_host",
+            "smtp_code",
+            "smtp_message",
+            "provider",
+            "domain",
+            "verified_at",
+            "error",
+        ]
+        select_cols = [c for c in expected if c in cols]
+        if "email" not in select_cols:
+            raise RuntimeError("DuckDB table verified_emails is missing required column: email")
+
+        query = f"SELECT {', '.join(select_cols)} FROM verified_emails"
+        if limit:
+            query += f" LIMIT {int(limit)}"
+
+        cursor = conn.execute(query)
+        migrated = 0
+        while True:
+            batch = cursor.fetchmany(batch_size)
+            if not batch:
+                break
+
+            results = []
+            for row in batch:
+                data = dict(zip(select_cols, row))
+                email = str(data.get("email") or "").strip()
+                if not email:
+                    continue
+
+                if not data.get("normalized"):
+                    data["normalized"] = email
+                if not data.get("reachability"):
+                    data["reachability"] = "unknown"
+                if not data.get("provider"):
+                    data["provider"] = "generic"
+                if not data.get("domain") and "@" in email:
+                    data["domain"] = email.split("@")[-1]
+                if not data.get("verified_at"):
+                    data["verified_at"] = datetime.now(timezone.utc)
+
+                results.append(VerificationResult.model_validate(data))
+
+            supa.upsert_results_batch(results, batch_size=len(results))
+            migrated += len(results)
+
+            if migrated and migrated % (batch_size * 10) == 0:
+                click.echo(f"Migrated {migrated} rows...")
+
+        click.echo(f"Migration complete: {migrated} rows upserted.")
+    finally:
+        conn.close()
 
 
 def _read_email_file(filepath: str) -> list[str]:

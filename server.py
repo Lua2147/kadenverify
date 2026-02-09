@@ -45,6 +45,21 @@ ENABLE_TIERED = os.environ.get("KADENVERIFY_TIERED", "true").lower() == "true"
 CACHE_BACKEND = os.environ.get("KADENVERIFY_CACHE_BACKEND", "duckdb").lower()
 CACHE_REDIS_URL = os.environ.get("KADENVERIFY_CACHE_REDIS_URL", os.environ.get("KADENVERIFY_REDIS_URL", ""))
 CACHE_TTL_SECONDS = int(os.environ.get("KADENVERIFY_CACHE_TTL_SECONDS", str(30 * 24 * 60 * 60)))
+SUPABASE_URL = os.environ.get("KADENVERIFY_SUPABASE_URL", os.environ.get("SUPABASE_URL", ""))
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
+    "KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY",
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""),
+)
+SUPABASE_TABLE = os.environ.get("KADENVERIFY_SUPABASE_TABLE", "verified_emails")
+SUPABASE_TIMEOUT_SECONDS = float(os.environ.get("KADENVERIFY_SUPABASE_TIMEOUT_SECONDS", "5.0"))
+
+# If Supabase is configured and the cache backend wasn't explicitly set, prefer Supabase.
+if (
+    "KADENVERIFY_CACHE_BACKEND" not in os.environ
+    and SUPABASE_URL
+    and SUPABASE_SERVICE_ROLE_KEY
+):
+    CACHE_BACKEND = "supabase"
 READINESS_DNS_HOST = os.environ.get("KADENVERIFY_READINESS_DNS_HOST", "gmail-smtp-in.l.google.com")
 READINESS_SMTP_HOST = os.environ.get("KADENVERIFY_READINESS_SMTP_HOST", "gmail-smtp-in.l.google.com")
 READINESS_SMTP_PORT = int(os.environ.get("KADENVERIFY_READINESS_SMTP_PORT", "25"))
@@ -232,6 +247,29 @@ async def _run_tiered_verification(email: str) -> tuple[VerificationResult, int,
 _cache_db = None
 _cache_db_lock = threading.Lock()
 _cache_redis = None
+_supabase_client = None
+_supabase_client_lock = threading.Lock()
+
+
+def _get_supabase_client():
+    """Create (lazily) a Supabase PostgREST client for verified email storage."""
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    with _supabase_client_lock:
+        if _supabase_client is not None:
+            return _supabase_client
+        from store.supabase_io import SupabaseRestClient
+
+        _supabase_client = SupabaseRestClient(
+            SUPABASE_URL,
+            SUPABASE_SERVICE_ROLE_KEY,
+            table=SUPABASE_TABLE,
+            timeout_seconds=SUPABASE_TIMEOUT_SECONDS,
+        )
+        return _supabase_client
 
 def _get_cache_db():
     """Get or create DuckDB connection for cache."""
@@ -241,8 +279,6 @@ def _get_cache_db():
             import duckdb
             cache_path = Path(__file__).parent / "verified.duckdb"
             _cache_db = duckdb.connect(str(cache_path))
-            _cache_db.execute("PRAGMA journal_mode='WAL'")
-            _cache_db.execute("PRAGMA synchronous='NORMAL'")
 
             # Ensure table exists
             _cache_db.execute("""
@@ -410,6 +446,15 @@ async def _cache_update_redis(result: VerificationResult) -> None:
 
 
 async def _cache_lookup(email: str) -> Optional[VerificationResult]:
+    if CACHE_BACKEND == "supabase":
+        client = _get_supabase_client()
+        if client is None:
+            return None
+        try:
+            return await asyncio.to_thread(client.get_by_email, email)
+        except Exception as e:
+            logger.error("Supabase cache lookup failed for %s: %s", email, e)
+            return None
     if CACHE_BACKEND == "redis":
         result = await _cache_lookup_redis(email)
         if result is not None:
@@ -418,6 +463,15 @@ async def _cache_lookup(email: str) -> Optional[VerificationResult]:
 
 
 async def _cache_update(result: VerificationResult):
+    if CACHE_BACKEND == "supabase":
+        client = _get_supabase_client()
+        if client is None:
+            return
+        try:
+            await asyncio.to_thread(client.upsert_result, result)
+        except Exception as e:
+            logger.error("Supabase cache update failed for %s: %s", result.email, e)
+        return
     if CACHE_BACKEND == "redis":
         await _cache_update_redis(result)
         return
@@ -703,6 +757,16 @@ async def omni_verify_post(request: SingleVerifyRequest):
 
 
 async def _readiness_check_cache() -> dict:
+    if CACHE_BACKEND == "supabase":
+        client = _get_supabase_client()
+        if client is None:
+            return {"ok": False, "detail": "supabase not configured"}
+        try:
+            await asyncio.to_thread(client.get_by_email, "readiness-check@example.com")
+            return {"ok": True, "detail": "supabase query ok"}
+        except Exception as e:
+            return {"ok": False, "detail": f"supabase error: {e}"}
+
     if CACHE_BACKEND == "redis":
         client = await _get_cache_redis()
         if client is None:
@@ -794,8 +858,14 @@ async def health():
 
 @app.get("/stats", dependencies=[Depends(verify_api_key)])
 async def stats_endpoint():
-    """Get verification statistics from verified.duckdb."""
+    """Get verification statistics from the verified email store."""
     try:
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if client is None:
+                return {"error": "supabase not configured", "total": 0}
+            return await asyncio.to_thread(client.get_stats)
+
         from store.duckdb_io import init_verified_db, get_stats
         conn = init_verified_db()
         s = get_stats(conn)

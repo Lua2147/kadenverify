@@ -85,13 +85,18 @@ chmod 750 "$INSTALL_DIR"
 if [ ! -f "$ENV_FILE" ]; then
   echo "📝 Creating secure environment file..."
   read -p "Enter API key (used by API auth): " api_key
+  read -p "Enter Supabase URL (https://...supabase.co): " supabase_url
+  read -s -p "Enter Supabase service role key: " supabase_key
+  echo ""
   cat > "$ENV_FILE" <<EOF
 KADENVERIFY_API_KEY=$api_key
 KADENVERIFY_HELO_DOMAIN=verify.kadenwood.com
 KADENVERIFY_FROM_ADDRESS=verify@kadenwood.com
 KADENVERIFY_CONCURRENCY=50
 KADENVERIFY_RATE_LIMIT_BACKEND=redis
-KADENVERIFY_CACHE_BACKEND=redis
+KADENVERIFY_CACHE_BACKEND=supabase
+KADENVERIFY_SUPABASE_URL=$supabase_url
+KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY=$supabase_key
 EOF
 fi
 chown root:"$APP_GROUP" "$ENV_FILE"
