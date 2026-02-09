@@ -4,6 +4,8 @@ Commands:
   verify       Verify a single email address
   verify-file  Verify emails from a text file
   pipeline     Run batch verification against a DuckDB source
+  find-email   Find email for a single contact (name + domain)
+  find-emails  Batch find emails from CSV
   stats        Show verification statistics from verified.duckdb
   migrate-duckdb-to-supabase  Upload verified_emails from DuckDB into Supabase
 """
@@ -313,6 +315,131 @@ def stats(verified_db: str):
 
     if conn is not None:
         conn.close()
+
+
+@main.command("find-email")
+@click.option("--first", required=True, help="First name")
+@click.option("--last", required=True, help="Last name")
+@click.option("--domain", required=True, help="Company domain")
+@click.option("--company", default=None, help="Company name (optional)")
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.option("--helo", default="verify.kadenwood.com", help="EHLO domain")
+@click.option("--from-addr", default="verify@kadenwood.com", help="MAIL FROM address")
+def find_email_cmd(first: str, last: str, domain: str, company: str, json_output: bool, helo: str, from_addr: str):
+    """Find email for a contact given name + domain."""
+    from engine.email_finder import find_email
+
+    result = asyncio.run(find_email(
+        first_name=first,
+        last_name=last,
+        domain=domain,
+        company_name=company,
+        helo_domain=helo,
+        from_address=from_addr,
+    ))
+
+    if json_output:
+        click.echo(json.dumps(result.model_dump(), indent=2))
+    else:
+        if result.email:
+            icon = {
+                Reachability.safe: "✓",
+                Reachability.risky: "~",
+                Reachability.unknown: "?",
+            }.get(result.reachability, "?")
+            click.echo(f"\n{icon} {result.email}")
+            click.echo(f"  Confidence:  {result.confidence:.2f}")
+            click.echo(f"  Method:      {result.method}")
+            click.echo(f"  Reachability: {result.reachability.value}")
+            click.echo(f"  Provider:    {result.provider.value}")
+            click.echo(f"  Catch-all:   {result.domain_is_catchall}")
+            click.echo(f"  Candidates:  {result.candidates_tried}")
+            if result.cost > 0:
+                click.echo(f"  Cost:        ${result.cost:.4f}")
+        else:
+            click.echo(f"\n✗ No email found for {first} {last} @ {domain}")
+            if result.error:
+                click.echo(f"  Error: {result.error}")
+            click.echo(f"  Candidates tried: {result.candidates_tried}")
+
+
+@main.command("find-emails")
+@click.argument("input_file", type=click.Path(exists=True))
+@click.option("--output", "-o", type=click.Path(), help="Output CSV path")
+@click.option("--concurrency", "-c", default=10, help="Max concurrent domains")
+@click.option("--helo", default="verify.kadenwood.com", help="EHLO domain")
+@click.option("--from-addr", default="verify@kadenwood.com", help="MAIL FROM address")
+def find_emails_cmd(input_file: str, output: str, concurrency: int, helo: str, from_addr: str):
+    """Batch find emails from a CSV file.
+
+    CSV must have columns: first_name, last_name, domain.
+    Optional column: company_name.
+    """
+    import csv
+
+    from engine.email_finder import find_emails_batch
+
+    contacts = []
+    with open(input_file) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if "first_name" in row and "last_name" in row and "domain" in row:
+                contacts.append({
+                    "first_name": row["first_name"],
+                    "last_name": row["last_name"],
+                    "domain": row["domain"],
+                    "company_name": row.get("company_name", ""),
+                })
+
+    if not contacts:
+        click.echo("No valid contacts found in CSV (need first_name, last_name, domain columns).")
+        return
+
+    click.echo(f"Finding emails for {len(contacts)} contacts (concurrency={concurrency})...")
+    pbar = tqdm(total=len(contacts), desc="Finding", unit="contact")
+
+    def on_progress(result):
+        pbar.update(1)
+
+    results = asyncio.run(find_emails_batch(
+        contacts=contacts,
+        concurrency=concurrency,
+        helo_domain=helo,
+        from_address=from_addr,
+        progress_callback=on_progress,
+    ))
+    pbar.close()
+
+    # Output results
+    found = sum(1 for r in results if r.email)
+    click.echo(f"\nFound: {found}/{len(contacts)} emails")
+
+    if output:
+        with open(output, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "first_name", "last_name", "domain", "email", "confidence",
+                "method", "reachability", "is_catchall", "cost",
+            ])
+            for contact, result in zip(contacts, results):
+                writer.writerow([
+                    contact["first_name"],
+                    contact["last_name"],
+                    contact["domain"],
+                    result.email or "",
+                    f"{result.confidence:.2f}",
+                    result.method,
+                    result.reachability.value,
+                    result.domain_is_catchall,
+                    f"{result.cost:.4f}",
+                ])
+        click.echo(f"Results written to {output}")
+    else:
+        for contact, result in zip(contacts, results):
+            if result.email:
+                click.echo(f"  ✓ {contact['first_name']} {contact['last_name']} → {result.email} ({result.confidence:.2f}, {result.method})")
+            else:
+                click.echo(f"  ✗ {contact['first_name']} {contact['last_name']} @ {contact['domain']} — not found")
 
 
 @main.command("migrate-duckdb-to-supabase")

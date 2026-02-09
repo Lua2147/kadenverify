@@ -63,6 +63,29 @@ class SyntaxResult(BaseModel):
     normalized: str = ""
 
 
+class CandidateResult(BaseModel):
+    """A single email candidate tested during email finding."""
+    email: str
+    pattern: str = ""           # e.g. "first.last"
+    smtp_code: int = 0
+    confidence: float = 0.0
+    source: str = ""            # "smtp", "apollo_local", "apollo_api", "exa", "pattern_score"
+
+
+class FinderResult(BaseModel):
+    """Result of email finding for a contact."""
+    email: Optional[str] = None          # Best found email (None if not found)
+    confidence: float = 0.0
+    method: str = ""                     # How it was found
+    reachability: Reachability = Reachability.unknown
+    domain_is_catchall: Optional[bool] = None
+    provider: Provider = Provider.generic
+    candidates_tried: int = 0
+    candidates: list[CandidateResult] = Field(default_factory=list)
+    cost: float = 0.0                   # Total enrichment spend
+    error: Optional[str] = None
+
+
 class VerificationResult(BaseModel):
     """Complete email verification result."""
     email: str

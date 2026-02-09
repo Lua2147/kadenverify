@@ -628,6 +628,16 @@ class SingleVerifyRequest(BaseModel):
 class BatchRequest(BaseModel):
     emails: list[str]
 
+class FindEmailRequest(BaseModel):
+    first_name: str
+    last_name: str
+    domain: str
+    company_name: Optional[str] = None
+
+class FindEmailBatchRequest(BaseModel):
+    contacts: list[FindEmailRequest]
+
+
 
 # --- Endpoints ---
 
@@ -726,6 +736,45 @@ async def verify_single_post(request: SingleVerifyRequest):
             from_address=FROM_ADDRESS,
         )
         return result.to_omniverifier()
+
+
+# --- Email Finder endpoints ---
+
+@app.post("/find-email", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+async def find_email_single(request: FindEmailRequest):
+    """Find an email address for a person at a domain."""
+    from engine.email_finder import find_email
+
+    result = await find_email(
+        first_name=request.first_name,
+        last_name=request.last_name,
+        domain=request.domain,
+        company_name=request.company_name,
+        helo_domain=HELO_DOMAIN,
+        from_address=FROM_ADDRESS,
+    )
+    return result.model_dump()
+
+
+@app.post("/find-email/batch", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+async def find_email_batch(request: FindEmailBatchRequest):
+    """Find emails for multiple contacts (grouped by domain for efficiency)."""
+    if len(request.contacts) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch size exceeds maximum of {MAX_BATCH_SIZE}",
+        )
+
+    from engine.email_finder import find_emails_batch
+
+    contacts = [c.model_dump() for c in request.contacts]
+    results = await find_emails_batch(
+        contacts=contacts,
+        concurrency=CONCURRENCY,
+        helo_domain=HELO_DOMAIN,
+        from_address=FROM_ADDRESS,
+    )
+    return [r.model_dump() for r in results]
 
 
 # --- OmniVerifier-compatible routes ---
