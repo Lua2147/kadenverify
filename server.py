@@ -674,6 +674,23 @@ async def verify_batch_endpoint(request: BatchRequest):
         helo_domain=HELO_DOMAIN,
         from_address=FROM_ADDRESS,
     )
+
+    # Persist batch results to the configured store backend.
+    # NOTE: /verify (single) uses the tiered engine which already performs cache update.
+    if CACHE_BACKEND == "supabase":
+        client = _get_supabase_client()
+        if client is not None:
+            try:
+                await asyncio.to_thread(client.upsert_results_batch, results, 500)
+            except Exception as e:
+                logger.error("Supabase cache update failed for batch: %s", e)
+    elif CACHE_BACKEND == "redis":
+        for result in results:
+            await _cache_update_redis(result)
+    else:
+        for result in results:
+            await _cache_update_duckdb(result)
+
     for result in results:
         if result.reachability == Reachability.safe:
             continue
