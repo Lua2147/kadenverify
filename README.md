@@ -240,6 +240,18 @@ curl -X POST 'http://localhost:8025/verify/batch' \
 | `KADENVERIFY_ENHANCE_CATCHALL` | `true` | Enable catch-all validation |
 | `APOLLO_DB_PATH` | (none) | Path to Apollo database for catch-all validation |
 
+### Supabase Setup
+
+1. Run `supabase/migrations/20260209_create_verified_emails.sql` in your Supabase project's SQL editor (creates `public.verified_emails`).
+2. Set `KADENVERIFY_CACHE_BACKEND=supabase` plus `KADENVERIFY_SUPABASE_URL` and `KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY`.
+3. Optional: migrate an existing local DuckDB cache into Supabase:
+
+```bash
+export KADENVERIFY_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+export KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
+python cli.py migrate-duckdb-to-supabase --duckdb-path verified.duckdb
+```
+
 ### Config File
 
 Create `config.json` (see `config.example.json`):
