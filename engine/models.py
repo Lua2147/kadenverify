@@ -87,7 +87,7 @@ class VerificationResult(BaseModel):
         Returns fields compatible with both kadenwood-ui and investor-outreach
         integration clients:
         - 'result' field maps: safe->deliverable, invalid->undeliverable,
-          catch_all->accept_all, unknown->unknown
+          risky+catch_all->accept_all, risky->risky, unknown->unknown
         - Boolean fields use both naming conventions for compatibility
         """
         if self.reachability == Reachability.safe:
@@ -96,6 +96,13 @@ class VerificationResult(BaseModel):
         elif self.reachability == Reachability.invalid:
             result = "undeliverable"
             status = "invalid"
+        elif self.reachability == Reachability.risky:
+            if self.is_catch_all:
+                result = "accept_all"
+                status = "catch_all"
+            else:
+                result = "risky"
+                status = "risky"
         elif self.is_catch_all:
             result = "accept_all"
             status = "catch_all"

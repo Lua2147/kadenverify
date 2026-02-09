@@ -151,6 +151,13 @@ async def verify_email_tiered(
     """Verify email using tiered approach with enrichment."""
     email = email.strip().lower()
 
+    # Normalize email for cache key (Gmail dot/plus stripping).
+    # All cache operations and downstream verification use the normalized form
+    # so that john.doe@gmail.com and johndoe@gmail.com share one cache entry.
+    syntax_pre = validate_syntax(email)
+    if syntax_pre.is_valid:
+        email = syntax_pre.normalized
+
     # Tier 1: Cached Results
     if force_tier != 2 and force_tier != 3 and cache_lookup_fn:
         cached = await _tier1_cached(email, cache_lookup_fn)
@@ -410,17 +417,22 @@ def _compute_fast_tier_confidence(meta: dict, dns_info: DnsInfo) -> float:
 
 
 def _infer_reachability(meta: dict, dns_info: DnsInfo) -> Reachability:
-    """Infer likely reachability without SMTP check."""
+    """Infer likely reachability without SMTP check.
+
+    Returns risky (not safe) for known providers because Tier 2 has no SMTP
+    confirmation. The Tier 3 background backfill will upgrade to safe after
+    SMTP verification succeeds.
+    """
     if meta["is_disposable"]:
         return Reachability.risky
     if meta["is_role"]:
         return Reachability.risky
     if dns_info.provider in [Provider.gmail, Provider.google_workspace]:
-        return Reachability.safe
+        return Reachability.risky
     if dns_info.provider == Provider.microsoft365:
-        return Reachability.safe
+        return Reachability.risky
     if meta["is_free"]:
-        return Reachability.safe
+        return Reachability.risky
 
     return Reachability.unknown
 
