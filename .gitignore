@@ -75,6 +75,9 @@ secrets.json
 # Local production overrides (may contain secrets)
 engine/enrichment.py.production
 
+# Supabase CLI local artifacts
+supabase/.temp/
+
 # Test data (optional - can commit sample data)
 # test_data/
 

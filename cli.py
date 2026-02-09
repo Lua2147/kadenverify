@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from engine.verifier import verify_email, verify_batch
 from engine.tiered_verifier import _tier1_cached
-from engine.models import Reachability
+from engine.models import Reachability, VerificationResult
 from store.supabase_io import supabase_client_from_env
 
 
