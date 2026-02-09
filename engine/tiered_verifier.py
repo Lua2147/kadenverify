@@ -7,8 +7,10 @@ Tier 4-5: Enrichment for unknowns (1-3s, $0-0.10)
 """
 
 import asyncio
+import inspect
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -21,10 +23,6 @@ from .verifier import verify_email as full_verify_email
 
 logger = logging.getLogger("kadenverify.tiered")
 
-# Cache TTL settings
-CACHE_TTL_DAYS = 30
-FAST_TIER_CONFIDENCE = 0.85
-
 # Load enrichment config
 try:
     config_path = Path(__file__).parent.parent / "config.json"
@@ -35,15 +33,117 @@ try:
         APOLLO_API_KEY = CONFIG.get("enrichment", {}).get("apollo_api_key")
 except Exception as e:
     logger.warning(f"Could not load enrichment config: {e}")
+    CONFIG = {}
     ENRICHMENT_ENABLED = False
     EXA_API_KEY = None
     APOLLO_API_KEY = None
+
+# Configurable heuristics and queue settings
+_tiered_config = CONFIG.get("tiered_verification", {})
+if not isinstance(_tiered_config, dict):
+    _tiered_config = {}
+
+CACHE_TTL_DAYS = int(os.environ.get("KADENVERIFY_CACHE_TTL_DAYS", "30"))
+FAST_TIER_CONFIDENCE = float(
+    os.environ.get(
+        "KADENVERIFY_FAST_TIER_CONFIDENCE",
+        str(
+            _tiered_config.get(
+                "fast_tier_confidence_threshold",
+                CONFIG.get("tiered_threshold", 0.85),
+            )
+        ),
+    )
+)
+FILTER_ROLE_ACCOUNTS = os.environ.get(
+    "KADENVERIFY_FILTER_ROLE_ACCOUNTS",
+    str(_tiered_config.get("filter_role_accounts", True)),
+).lower() == "true"
+TIER3_BG_QUEUE_SIZE = int(os.environ.get("KADENVERIFY_TIER3_BG_QUEUE_SIZE", "500"))
+TIER3_BG_WORKERS = int(os.environ.get("KADENVERIFY_TIER3_BG_WORKERS", "8"))
+
+
+async def _maybe_await(result):
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _cache_lookup(cache_lookup_fn, email: str) -> Optional[VerificationResult]:
+    if not cache_lookup_fn:
+        return None
+    return await _maybe_await(cache_lookup_fn(email))
+
+
+async def _cache_update(cache_update_fn, result: VerificationResult) -> None:
+    if not cache_update_fn:
+        return
+    await _maybe_await(cache_update_fn(result))
+
+
+async def _emit_event(event_callback, event: dict) -> None:
+    if not event_callback:
+        return
+    try:
+        await _maybe_await(event_callback(event))
+    except Exception as e:
+        logger.debug("Event callback failed: %s", e)
+
+
+class Tier3BackgroundScheduler:
+    """Bounded background queue for Tier-3 SMTP backfill work."""
+
+    def __init__(self, max_queue_size: int, workers: int):
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
+        self._workers = max(0, workers)
+        self._started = False
+        self._worker_tasks: list[asyncio.Task] = []
+        self._start_lock = asyncio.Lock()
+
+    async def _ensure_started(self) -> None:
+        if self._started or self._workers == 0:
+            return
+        async with self._start_lock:
+            if self._started:
+                return
+            for idx in range(self._workers):
+                task = asyncio.create_task(self._worker_loop(idx))
+                self._worker_tasks.append(task)
+            self._started = True
+
+    async def enqueue(self, item: tuple[str, str, str, object]) -> bool:
+        await self._ensure_started()
+        try:
+            self._queue.put_nowait(item)
+            return True
+        except asyncio.QueueFull:
+            return False
+
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        while True:
+            email, helo_domain, from_address, cache_update_fn = await self._queue.get()
+            try:
+                await _tier3_background(email, helo_domain, from_address, cache_update_fn)
+            except Exception as e:
+                logger.error("Tier-3 background worker %s failed for %s: %s", worker_id, email, e)
+            finally:
+                self._queue.task_done()
+
+
+_tier3_scheduler = Tier3BackgroundScheduler(
+    max_queue_size=TIER3_BG_QUEUE_SIZE,
+    workers=TIER3_BG_WORKERS,
+)
 
 
 async def verify_email_tiered(
     email: str,
     cache_lookup_fn=None,
     cache_update_fn=None,
+    event_callback=None,
     force_tier: Optional[int] = None,
     helo_domain: str = "verify.kadenwood.com",
     from_address: str = "verify@kadenwood.com",
@@ -55,7 +155,21 @@ async def verify_email_tiered(
     if force_tier != 2 and force_tier != 3 and cache_lookup_fn:
         cached = await _tier1_cached(email, cache_lookup_fn)
         if cached:
+            await _emit_event(event_callback, {"type": "cache_lookup", "hit": True})
+            await _emit_event(
+                event_callback,
+                {
+                    "type": "verification_result",
+                    "tier": 1,
+                    "reason": "cached_result",
+                    "enrichment_cost": 0.0,
+                    "reachability": cached.reachability.value,
+                    "smtp_code": cached.smtp_code,
+                    "error": cached.error,
+                },
+            )
             return cached, 1, "cached_result"
+        await _emit_event(event_callback, {"type": "cache_lookup", "hit": False})
 
     # Tier 2: Fast Validation
     if force_tier != 3:
@@ -64,19 +178,51 @@ async def verify_email_tiered(
             result, confidence = fast_result
             if confidence >= FAST_TIER_CONFIDENCE or force_tier == 2:
                 if cache_update_fn:
-                    asyncio.create_task(_tier3_background(email, helo_domain, from_address, cache_update_fn))
+                    enqueued = await _tier3_scheduler.enqueue(
+                        (email, helo_domain, from_address, cache_update_fn)
+                    )
+                    if not enqueued:
+                        logger.warning(
+                            "Tier-3 background queue full (%s). Skipping async backfill for %s",
+                            _tier3_scheduler.queue_size(),
+                            email,
+                        )
+                await _emit_event(
+                    event_callback,
+                    {
+                        "type": "verification_result",
+                        "tier": 2,
+                        "reason": f"fast_validation_confidence_{confidence:.2f}",
+                        "enrichment_cost": 0.0,
+                        "reachability": result.reachability.value,
+                        "smtp_code": result.smtp_code,
+                        "error": result.error,
+                    },
+                )
                 return result, 2, f"fast_validation_confidence_{confidence:.2f}"
 
     # Tier 3: Full SMTP Verification
     result = await full_verify_email(email, helo_domain, from_address)
 
     # Filter out role accounts completely
-    if result.is_role:
+    if FILTER_ROLE_ACCOUNTS and result.is_role:
         result.reachability = Reachability.invalid
         result.is_deliverable = False
         result.error = "role account filtered"
         if cache_update_fn:
-            cache_update_fn(result)
+            await _cache_update(cache_update_fn, result)
+        await _emit_event(
+            event_callback,
+            {
+                "type": "verification_result",
+                "tier": 3,
+                "reason": "role_account_filtered",
+                "enrichment_cost": 0.0,
+                "reachability": result.reachability.value,
+                "smtp_code": result.smtp_code,
+                "error": result.error,
+            },
+        )
         return result, 3, "role_account_filtered"
 
     # Tier 4-5: Enrichment for unknowns AND catch-all domains
@@ -111,11 +257,23 @@ async def verify_email_tiered(
             # Update cache with enriched result
             if cache_update_fn:
                 try:
-                    cache_update_fn(result)
+                    await _cache_update(cache_update_fn, result)
                 except Exception as e:
                     logger.error(f"Cache update failed: {e}")
 
             tier_num = 4 if 'tier4' in reason else 5
+            await _emit_event(
+                event_callback,
+                {
+                    "type": "verification_result",
+                    "tier": tier_num,
+                    "reason": reason,
+                    "enrichment_cost": cost,
+                    "reachability": result.reachability.value,
+                    "smtp_code": result.smtp_code,
+                    "error": result.error,
+                },
+            )
             return result, tier_num, reason
 
         except Exception as e:
@@ -124,9 +282,22 @@ async def verify_email_tiered(
     # Update cache with SMTP result
     if cache_update_fn:
         try:
-            cache_update_fn(result)
+            await _cache_update(cache_update_fn, result)
         except Exception as e:
             logger.error(f"Cache update failed: {e}")
+
+    await _emit_event(
+        event_callback,
+        {
+            "type": "verification_result",
+            "tier": 3,
+            "reason": "full_smtp_verification",
+            "enrichment_cost": 0.0,
+            "reachability": result.reachability.value,
+            "smtp_code": result.smtp_code,
+            "error": result.error,
+        },
+    )
 
     return result, 3, "full_smtp_verification"
 
@@ -134,11 +305,18 @@ async def verify_email_tiered(
 async def _tier1_cached(email: str, cache_lookup_fn) -> Optional[VerificationResult]:
     """Tier 1: Return cached result if fresh."""
     try:
-        cached = cache_lookup_fn(email)
+        cached = await _cache_lookup(cache_lookup_fn, email)
         if not cached:
             return None
 
-        age = datetime.now(timezone.utc) - cached.verified_at
+        verified_at = cached.verified_at
+        if verified_at.tzinfo is None:
+            # DuckDB TIMESTAMP values are commonly naive UTC datetimes.
+            verified_at = verified_at.replace(tzinfo=timezone.utc)
+        else:
+            verified_at = verified_at.astimezone(timezone.utc)
+
+        age = datetime.now(timezone.utc) - verified_at
         if age > timedelta(days=CACHE_TTL_DAYS):
             logger.debug(f"Cache expired for {email}")
             return None
@@ -252,7 +430,7 @@ async def _tier3_background(email: str, helo_domain: str, from_address: str, cac
     try:
         logger.info(f"Background SMTP verification for {email}")
         result = await full_verify_email(email, helo_domain, from_address)
-        cache_update_fn(result)
+        await _cache_update(cache_update_fn, result)
         logger.info(f"Background verification complete: {email}")
     except Exception as e:
         logger.error(f"Background verification failed for {email}: {e}")

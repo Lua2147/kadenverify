@@ -271,13 +271,24 @@ async def verify_batch(
 
         async with semaphore:
             async with domain_locks[domain]:
-                result = await verify_email(
-                    email=email,
-                    helo_domain=helo_domain,
-                    from_address=from_address,
-                    dns_cache=dns_cache,
-                    catch_all_cache=catch_all_cache,
-                )
+                try:
+                    result = await verify_email(
+                        email=email,
+                        helo_domain=helo_domain,
+                        from_address=from_address,
+                        dns_cache=dns_cache,
+                        catch_all_cache=catch_all_cache,
+                    )
+                except Exception:
+                    logger.exception("Verification failed for %s", email)
+                    result = VerificationResult(
+                        email=email,
+                        normalized=email.strip().lower(),
+                        reachability=Reachability.unknown,
+                        is_deliverable=None,
+                        domain=domain,
+                        error="internal verification error",
+                    )
                 if progress_callback:
                     progress_callback(result)
                 return result
