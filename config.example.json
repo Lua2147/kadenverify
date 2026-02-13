@@ -36,10 +36,7 @@
   },
   "rate_limiting": {
     "enabled": true,
-    "backend": "redis",
-    "redis_url": "redis://127.0.0.1:6379/0",
     "window_seconds": 60,
-    "max_requests": 100,
-    "key_mode": "api_key_and_ip"
+    "max_requests": 100
   }
 }

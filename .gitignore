@@ -66,18 +66,6 @@ secrets.json
 !config.example.json
 !**/config.example.json
 
-# Local agent notes (do not commit)
-/task_plan.md
-/progress.md
-/findings.md
-/CLAUDE.md
-
-# Local production overrides (may contain secrets)
-engine/enrichment.py.production
-
-# Supabase CLI local artifacts
-supabase/.temp/
-
 # Test data (optional - can commit sample data)
 # test_data/
 

@@ -14,7 +14,6 @@ dependencies = [
     "uvicorn>=0.29",
     "tqdm>=4.66",
     "slowapi>=0.1",
-    "redis>=5.0",
 ]
 
 [project.scripts]

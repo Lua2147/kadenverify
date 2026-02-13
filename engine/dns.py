@@ -18,24 +18,20 @@ logger = logging.getLogger("kadenverify.dns")
 DNS_TIMEOUT = 10.0
 
 
-def _detect_provider(mx_hosts: list[str], domain: str = "") -> Provider:
+def _detect_provider(mx_hosts: list[str]) -> Provider:
     """Detect email provider from MX hostnames.
 
     Checks the highest-priority (first) MX host against known patterns.
-    Uses domain to distinguish Gmail personal from Google Workspace.
     """
     if not mx_hosts:
         return Provider.generic
-
-    domain_lower = domain.lower().rstrip(".")
 
     for mx in mx_hosts:
         mx_lower = mx.lower().rstrip(".")
 
         # Google (Gmail / Google Workspace)
         if mx_lower.endswith(".google.com") or mx_lower.endswith(".googlemail.com"):
-            if domain_lower in ("gmail.com", "googlemail.com"):
-                return Provider.gmail
+            # Could be personal gmail or Google Workspace
             return Provider.google_workspace
 
         # Yahoo
@@ -92,7 +88,7 @@ async def lookup_mx(domain: str, timeout: float = DNS_TIMEOUT) -> DnsInfo:
             logger.debug(f"AAAA lookup failed for {domain}: {e}")
 
     has_mx = len(mx_hosts) > 0
-    provider = _detect_provider(mx_hosts, domain) if has_mx else Provider.generic
+    provider = _detect_provider(mx_hosts) if has_mx else Provider.generic
 
     return DnsInfo(
         mx_hosts=mx_hosts,

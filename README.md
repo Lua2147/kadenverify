@@ -232,25 +232,8 @@ curl -X POST 'http://localhost:8025/verify/batch' \
 | `KADENVERIFY_FROM_ADDRESS` | `verify@kadenwood.com` | SMTP MAIL FROM address |
 | `KADENVERIFY_CONCURRENCY` | `5` | Max concurrent SMTP connections |
 | `KADENVERIFY_TIERED` | `true` | Enable tiered verification (3-tier system) |
-| `KADENVERIFY_CACHE_BACKEND` | `duckdb` | Verified email store backend: `duckdb`, `redis`, or `supabase` |
-| `KADENVERIFY_SUPABASE_URL` | (none) | Supabase project URL (enables `supabase` backend) |
-| `KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY` | (none) | Supabase service role key (required for `supabase` backend) |
-| `KADENVERIFY_SUPABASE_TABLE` | `verified_emails` | Supabase table name |
-| `KADENVERIFY_SUPABASE_TIMEOUT_SECONDS` | `5.0` | Supabase REST timeout in seconds |
 | `KADENVERIFY_ENHANCE_CATCHALL` | `true` | Enable catch-all validation |
 | `APOLLO_DB_PATH` | (none) | Path to Apollo database for catch-all validation |
-
-### Supabase Setup
-
-1. Run `supabase/migrations/20260209_create_verified_emails.sql` in your Supabase project's SQL editor (creates `public.verified_emails`).
-2. Set `KADENVERIFY_CACHE_BACKEND=supabase` plus `KADENVERIFY_SUPABASE_URL` and `KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY`.
-3. Optional: migrate an existing local DuckDB cache into Supabase:
-
-```bash
-export KADENVERIFY_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-export KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
-python cli.py migrate-duckdb-to-supabase --duckdb-path verified.duckdb
-```
 
 ### Config File
 
@@ -300,9 +283,6 @@ KADENVERIFY_API_KEY=your-secret-key
 KADENVERIFY_HELO_DOMAIN=verify.yourdomain.com
 KADENVERIFY_FROM_ADDRESS=verify@yourdomain.com
 KADENVERIFY_CONCURRENCY=20
-KADENVERIFY_CACHE_BACKEND=supabase
-KADENVERIFY_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
 ```
 
 ### DNS Requirements
