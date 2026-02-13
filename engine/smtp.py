@@ -17,13 +17,13 @@ from .models import SmtpResponse
 logger = logging.getLogger("kadenverify.smtp")
 
 # Defaults
-DEFAULT_HELO_DOMAIN = "verify.kadenwood.com"
-DEFAULT_FROM_ADDRESS = "verify@kadenwood.com"
-CONNECT_TIMEOUT = 5  # Reduced from 10s
-COMMAND_TIMEOUT = 5  # Reduced from 10s
-TOTAL_TIMEOUT = 20   # Reduced from 45s
-GREYLIST_DELAY = 30  # Not used if RETRIES = 0
-GREYLIST_RETRIES = 0  # Skip retries for speed - mark unknown instead
+DEFAULT_HELO_DOMAIN = "198-23-249-137-host.colocrossing.com"
+DEFAULT_FROM_ADDRESS = "postmaster@198-23-249-137-host.colocrossing.com"
+CONNECT_TIMEOUT = 10
+COMMAND_TIMEOUT = 10
+TOTAL_TIMEOUT = 45
+GREYLIST_DELAY = 35
+GREYLIST_RETRIES = 2
 SMTP_PORT = 25
 
 
