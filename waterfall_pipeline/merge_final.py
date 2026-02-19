@@ -4,8 +4,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .qa import qa_assert_file, qa_validate_person_csv, write_qa_report
-from .schema import clean, is_email, union_field_order, write_csv_rows
+try:
+    from .qa import qa_assert_file, qa_validate_person_csv, write_qa_report
+    from .schema import clean, is_email, union_field_order, write_csv_rows
+except ImportError:  # pragma: no cover
+    from qa import qa_assert_file, qa_validate_person_csv, write_qa_report
+    from schema import clean, is_email, union_field_order, write_csv_rows
 
 GOOD = {"deliverable", "accept_all"}
 
@@ -51,10 +55,8 @@ def merge_rows(stage1_rows: list[dict], extra_provider: list[dict], extra_reveri
 
             row2 = dict(row)
             row2["email"] = new_email
-            if "email_source" in row2:
-                row2["email_source"] = clean(row.get("new_email_source")) or row2.get("email_source") or source_label
-            if "result" in row2:
-                row2["result"] = verify_result
+            row2["email_source"] = clean(row.get("new_email_source")) or row2.get("email_source") or source_label
+            row2["result"] = verify_result
 
             full_name = norm(row2.get("full_name"))
             key = (new_email, full_name)
@@ -118,8 +120,15 @@ def run(args: argparse.Namespace) -> None:
     reverify_rows = read_rows_or_empty(reverify_extra)
 
     merged, summary = merge_rows(stage1_rows, provider_rows, reverify_rows)
+    field_order: list[str] = []
     if merged:
-        write_csv_rows(output_csv, merged, field_order=union_field_order(merged))
+        field_order = union_field_order(merged)
+    else:
+        for source_rows in (stage1_rows, provider_rows, reverify_rows):
+            if source_rows:
+                field_order = union_field_order(source_rows)
+                break
+    write_csv_rows(output_csv, merged, field_order=field_order)
 
     summary_lines = [
         f"stage1_state={stage1_state}",
