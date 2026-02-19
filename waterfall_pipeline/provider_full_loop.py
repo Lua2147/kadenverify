@@ -127,6 +127,94 @@ def apollo_local_lookup(dedup_csv: Path) -> dict[str, dict]:
     return out
 
 
+
+def warehouse_org_domain_lookup(dedup_csv: Path, db_path: str, source: str) -> dict[str, dict]:
+    con = duckdb.connect()
+    con.execute(f"ATTACH '{db_path}' AS wh (READ_ONLY)")
+
+    q = f"""
+    CREATE OR REPLACE TEMP TABLE input_candidates AS
+    SELECT
+      contact_key,
+      lower(trim(first_name)) AS first_name,
+      lower(trim(last_name)) AS last_name,
+      lower(trim(domain)) AS domain
+    FROM read_csv_auto('{str(dedup_csv).replace("'", "''")}', header=true, all_varchar=true);
+
+    CREATE OR REPLACE TEMP TABLE wh_matches AS
+    SELECT
+      i.contact_key,
+      lower(trim(p.email)) AS email
+    FROM input_candidates i
+    JOIN wh.persons p
+      ON lower(trim(p.first_name)) = i.first_name
+     AND lower(trim(p.last_name)) = i.last_name
+     AND lower(trim(p.org_domain)) = i.domain
+    WHERE p.email IS NOT NULL
+      AND trim(p.email) <> '';
+    """
+    con.execute(q)
+
+    rows = con.execute(
+        """
+        SELECT contact_key, min(email) AS email
+        FROM wh_matches
+        GROUP BY 1
+        """
+    ).fetchall()
+    con.close()
+
+    out: dict[str, dict] = {}
+    for key, email in rows:
+        if is_email(email):
+            out[key] = {"email": email.strip().lower(), "source": source}
+    return out
+
+
+def warehouse_ldpd_lookup(dedup_csv: Path) -> dict[str, dict]:
+    con = duckdb.connect()
+    con.execute("ATTACH '/data/people-warehouse/ldpd.duckdb' AS ldpd (READ_ONLY)")
+
+    q = f"""
+    CREATE OR REPLACE TEMP TABLE input_candidates AS
+    SELECT
+      contact_key,
+      lower(trim(first_name)) AS first_name,
+      lower(trim(last_name)) AS last_name,
+      lower(trim(domain)) AS domain
+    FROM read_csv_auto('{str(dedup_csv).replace("'", "''")}', header=true, all_varchar=true);
+
+    CREATE OR REPLACE TEMP TABLE ldpd_matches AS
+    SELECT DISTINCT
+      i.contact_key,
+      lower(trim(email)) AS email
+    FROM input_candidates i
+    JOIN ldpd.persons p
+      ON lower(trim(p.first_name)) = i.first_name
+     AND lower(trim(p.last_name)) = i.last_name
+    CROSS JOIN UNNEST(p.emails) AS t(email)
+    WHERE email IS NOT NULL
+      AND trim(email) <> ''
+      AND lower(split_part(email, '@', 2)) = i.domain;
+    """
+    con.execute(q)
+
+    rows = con.execute(
+        """
+        SELECT contact_key, min(email) AS email
+        FROM ldpd_matches
+        GROUP BY 1
+        """
+    ).fetchall()
+    con.close()
+
+    out: dict[str, dict] = {}
+    for key, email in rows:
+        if is_email(email):
+            out[key] = {"email": email.strip().lower(), "source": "warehouse_ldpd"}
+    return out
+
+
 async def run_provider(
     name: str,
     contacts: list[dict],
@@ -357,6 +445,7 @@ async def run(args: argparse.Namespace) -> None:
     aleads_key = clean(config.get("a_leads", {}).get("api_key", ""))
     prospeo_key = clean(config.get("prospeo", {}).get("api_key", ""))
     apollo_key = clean(config.get("apollo", {}).get("api_key", ""))
+    pdl_key = clean(config.get("peopledatalabs", {}).get("api_key", ""))
 
     state = load_json(state_json)
     if args.force_restart:
@@ -408,6 +497,103 @@ async def run(args: argparse.Namespace) -> None:
         completed.add("apollo_local")
         persist_state()
 
+    
+
+    # Stage 1b: Qualified local DB
+    if "warehouse_qualified" not in completed:
+        print("Stage 1b: Qualified local DB", flush=True)
+        t0 = time.time()
+        wh = warehouse_org_domain_lookup(
+            dedup_csv,
+            "/data/people-warehouse/qualified.duckdb",
+            source="warehouse_qualified",
+        )
+        added = 0
+        for k, v in wh.items():
+            if k in keys_all and k not in found_by_key:
+                found_by_key[k] = v
+                added += 1
+        source_counts["warehouse_qualified"] = source_counts.get("warehouse_qualified", 0) + added
+        stage_metrics["warehouse_qualified"] = {
+            "queried": len(keys_all),
+            "found": added,
+            "errors": 0,
+            "minutes": round((time.time() - t0) / 60, 2),
+            "yield": (added / len(keys_all)) if keys_all else 0.0,
+        }
+        completed.add("warehouse_qualified")
+        persist_state()
+
+    # Stage 1c: 82m local DB
+    if "warehouse_82m" not in completed:
+        print("Stage 1c: 82m local DB", flush=True)
+        t0 = time.time()
+        wh = warehouse_org_domain_lookup(
+            dedup_csv,
+            "/data/people-warehouse/82m.duckdb",
+            source="warehouse_82m",
+        )
+        added = 0
+        for k, v in wh.items():
+            if k in keys_all and k not in found_by_key:
+                found_by_key[k] = v
+                added += 1
+        source_counts["warehouse_82m"] = source_counts.get("warehouse_82m", 0) + added
+        stage_metrics["warehouse_82m"] = {
+            "queried": len(keys_all),
+            "found": added,
+            "errors": 0,
+            "minutes": round((time.time() - t0) / 60, 2),
+            "yield": (added / len(keys_all)) if keys_all else 0.0,
+        }
+        completed.add("warehouse_82m")
+        persist_state()
+
+    # Stage 1d: L-Series local DB
+    if "warehouse_l_series" not in completed:
+        print("Stage 1d: L-Series local DB", flush=True)
+        t0 = time.time()
+        wh = warehouse_org_domain_lookup(
+            dedup_csv,
+            "/data/people-warehouse/l_series.duckdb",
+            source="warehouse_l_series",
+        )
+        added = 0
+        for k, v in wh.items():
+            if k in keys_all and k not in found_by_key:
+                found_by_key[k] = v
+                added += 1
+        source_counts["warehouse_l_series"] = source_counts.get("warehouse_l_series", 0) + added
+        stage_metrics["warehouse_l_series"] = {
+            "queried": len(keys_all),
+            "found": added,
+            "errors": 0,
+            "minutes": round((time.time() - t0) / 60, 2),
+            "yield": (added / len(keys_all)) if keys_all else 0.0,
+        }
+        completed.add("warehouse_l_series")
+        persist_state()
+
+    # Stage 1e: LDPD local DB
+    if "warehouse_ldpd" not in completed:
+        print("Stage 1e: LDPD local DB", flush=True)
+        t0 = time.time()
+        wh = warehouse_ldpd_lookup(dedup_csv)
+        added = 0
+        for k, v in wh.items():
+            if k in keys_all and k not in found_by_key:
+                found_by_key[k] = v
+                added += 1
+        source_counts["warehouse_ldpd"] = source_counts.get("warehouse_ldpd", 0) + added
+        stage_metrics["warehouse_ldpd"] = {
+            "queried": len(keys_all),
+            "found": added,
+            "errors": 0,
+            "minutes": round((time.time() - t0) / 60, 2),
+            "yield": (added / len(keys_all)) if keys_all else 0.0,
+        }
+        completed.add("warehouse_ldpd")
+        persist_state()
     print(f"Remaining after Stage1: {len(remaining_rows())}", flush=True)
 
     async def worker_aleads(session: aiohttp.ClientSession, c: dict) -> dict | None:
@@ -491,13 +677,62 @@ async def run(args: argparse.Namespace) -> None:
                 return None
         return None
 
+
+    async def worker_peopledatalabs(session: aiohttp.ClientSession, c: dict) -> dict | None:
+        if not pdl_key:
+            return None
+
+        company = c.get("domain") or c.get("company") or ""
+        if not company:
+            return None
+
+        url = "https://api.peopledatalabs.com/v5/person/enrich"
+        headers = {"X-Api-Key": pdl_key}
+        params = {
+            "first_name": c.get("first_name", ""),
+            "last_name": c.get("last_name", ""),
+            "company": company,
+            "required": "work_email",
+            "include_if_matched": "true",
+            "pretty": "false",
+            "titlecase": "false",
+            "data_include": "work_email",
+        }
+
+        for attempt in range(1, 4):
+            try:
+                async with session.get(url, headers=headers, params=params) as resp:
+                    if resp.status == 200:
+                        payload = await resp.json()
+                        matched = payload.get("matched") or []
+                        if matched and "company" not in {str(x) for x in matched}:
+                            return None
+
+                        person = payload.get("data") or {}
+                        email = clean(person.get("work_email", "")).lower()
+                        if is_email(email):
+                            return {"email": email, "source": "peopledatalabs"}
+                        return None
+
+                    if resp.status in (400, 404):
+                        return None
+                    if resp.status == 429:
+                        await asyncio.sleep(2 * attempt)
+                        continue
+                    return None
+            except Exception:
+                await asyncio.sleep(attempt)
+
+        return None
+
     stage_workers: dict[str, tuple[Callable, int, int]] = {
         "a_leads": (worker_aleads, 8, 1000),
         "prospeo": (worker_prospeo, 10, 1000),
         "apollo_api": (worker_apollo_api, 4, 500),
+        "peopledatalabs": (worker_peopledatalabs, 4, 500),
     }
 
-    paid_default = ["a_leads", "prospeo", "apollo_api"]
+    paid_default = ["a_leads", "prospeo", "apollo_api", "peopledatalabs"]
     yield_stats = load_json(yield_stats_json)
     paid_ranked = rank_paid_stages(yield_stats, paid_default)
     print(f"Paid stage order (yield-ranked): {paid_ranked}", flush=True)
