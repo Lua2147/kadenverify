@@ -10,8 +10,12 @@ from pathlib import Path
 
 import aiohttp
 
-from .qa import qa_assert_file, write_qa_report
-from .schema import clean
+try:
+    from .qa import qa_assert_file, write_qa_report
+    from .schema import clean
+except ImportError:  # pragma: no cover
+    from qa import qa_assert_file, write_qa_report
+    from schema import clean
 
 GOOD = {"deliverable", "accept_all"}
 
@@ -37,6 +41,13 @@ def make_contact_key(row: dict) -> str:
     if not (valid_name(first) and valid_name(last) and domain):
         return ""
     return f"{first.lower()}|{last.lower()}|{domain.lower()}"
+
+
+def parse_int(value: str | int | None, default: int = 0) -> int:
+    try:
+        return int(clean(str(value or "")))
+    except Exception:
+        return default
 
 
 def load_waterfall_rows(path: Path) -> tuple[dict[str, dict], list[str]]:
@@ -72,6 +83,8 @@ def load_unresolved_from_verified(path: Path) -> tuple[dict[str, dict], list[str
                 "prev_result": prev or "unknown",
                 "current_result": prev or "unknown",
                 "resolved_iter": "",
+                "unknown_streak": "0",
+                "next_retry_iter": "",
             }
     return unresolved, []
 
@@ -86,6 +99,7 @@ def load_unresolved_from_state(path: Path) -> tuple[dict[str, dict], list[str]]:
         r = csv.DictReader(f)
         fieldnames = list(r.fieldnames or [])
         iter_cols = [c for c in fieldnames if c.startswith("iter_") and c.endswith("_result")]
+        has_unknown_streak = "unknown_streak" in fieldnames
         for row in r:
             key = clean(row.get("contact_key"))
             email = clean(row.get("email")).lower()
@@ -95,6 +109,18 @@ def load_unresolved_from_state(path: Path) -> tuple[dict[str, dict], list[str]]:
 
             prev = clean(row.get("prev_result") or row.get("verify_result")).lower()
             cur = clean(row.get("current_result") or prev or "unknown").lower()
+            unknown_streak = max(0, parse_int(row.get("unknown_streak"), 0))
+            if not has_unknown_streak:
+                # Backfill streak from historical iter columns for legacy state files.
+                streak = 0
+                for c in reversed(iter_cols):
+                    v = clean(row.get(c)).lower()
+                    if v == "unknown":
+                        streak += 1
+                        continue
+                    if v:
+                        break
+                unknown_streak = streak
             out = {
                 "contact_key": key,
                 "email": email,
@@ -102,6 +128,10 @@ def load_unresolved_from_state(path: Path) -> tuple[dict[str, dict], list[str]]:
                 "prev_result": prev or "unknown",
                 "current_result": cur or "unknown",
                 "resolved_iter": clean(row.get("resolved_iter")),
+                "unknown_streak": str(unknown_streak),
+                "next_retry_iter": str(max(0, parse_int(row.get("next_retry_iter"), 0)))
+                if parse_int(row.get("next_retry_iter"), 0) > 0
+                else "",
             }
             for c in iter_cols:
                 out[c] = clean(row.get(c)).lower()
@@ -154,7 +184,12 @@ async def verify_emails(api_url: str, api_key: str, emails: list[str], batch_siz
 
 
 def write_state(path: Path, rows: dict[str, dict], iter_cols: list[str]) -> None:
-    fields = ["contact_key", "email", "source", "prev_result"] + iter_cols + ["current_result", "resolved_iter"]
+    fields = ["contact_key", "email", "source", "prev_result"] + iter_cols + [
+        "current_result",
+        "resolved_iter",
+        "unknown_streak",
+        "next_retry_iter",
+    ]
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -200,7 +235,10 @@ def write_summary(
     ]
     for s in iter_counts:
         lines.append(
-            f"  - iter={s['iter']} queried={s['queried']} newly_deliverable={s['deliverable']} newly_catch_all={s['catch_all']} gains={s['gains']} gain_rate={s['gain_rate']:.6f} remaining={s['remaining']}"
+            f"  - iter={s['iter']} pending={s.get('pending', s['queried'])} eligible={s.get('eligible', s['queried'])} "
+            f"queried={s['queried']} verify_miss={s.get('verify_miss', 0)} backoff_skipped={s.get('backoff_skipped', 0)} "
+            f"newly_deliverable={s['deliverable']} newly_catch_all={s['catch_all']} "
+            f"gains={s['gains']} gain_rate={s['gain_rate']:.6f} remaining={s['remaining']}"
         )
     lines.append("final_results:")
     for k, v in final_counts.most_common():
@@ -254,20 +292,75 @@ async def run(args: argparse.Namespace) -> None:
     low_gain_streak = 0
     stop_reason = "max_iters"
 
+    if args.unknown_streak_lock > 0:
+        retry_gap = max(args.unknown_retry_gap_iters, 1)
+        primed = 0
+        for row in unresolved.values():
+            if row.get("current_result") in GOOD:
+                continue
+            unknown_streak = parse_int(row.get("unknown_streak"), 0)
+            next_retry_iter = parse_int(row.get("next_retry_iter"), 0)
+            if unknown_streak >= args.unknown_streak_lock and next_retry_iter <= 0:
+                row["next_retry_iter"] = str(next_iter + retry_gap)
+                primed += 1
+        if primed:
+            print(
+                f"[reverify] primed_backoff_rows={primed} "
+                f"unknown_streak_lock={args.unknown_streak_lock} retry_gap_iters={retry_gap}",
+                flush=True,
+            )
+
     for offset in range(args.max_iters):
         i = next_iter + offset
-        pending_keys = [k for k, r in unresolved.items() if r.get("current_result") not in GOOD]
-        if not pending_keys:
+        all_pending_keys = [k for k, r in unresolved.items() if r.get("current_result") not in GOOD]
+        if not all_pending_keys:
             stop_reason = "resolved_all"
             break
+
+        pending_keys = []
+        backoff_skipped = 0
+        for key in all_pending_keys:
+            row = unresolved[key]
+            next_retry_iter = parse_int(row.get("next_retry_iter"), 0)
+            if next_retry_iter > i:
+                backoff_skipped += 1
+                continue
+            pending_keys.append(key)
+
+        iter_col = f"iter_{i}_result"
+        iter_cols.append(iter_col)
+
+        if not pending_keys:
+            remaining = len(all_pending_keys)
+            print(
+                f"[reverify] iter={i} pending={len(all_pending_keys)} eligible=0 backoff_skipped={backoff_skipped} "
+                "action=skip_no_eligible",
+                flush=True,
+            )
+            iter_stats.append(
+                {
+                    "iter": i,
+                    "pending": len(all_pending_keys),
+                    "eligible": 0,
+                    "queried": 0,
+                    "verify_miss": 0,
+                    "backoff_skipped": backoff_skipped,
+                    "deliverable": 0,
+                    "catch_all": 0,
+                    "gains": 0,
+                    "gain_rate": 0.0,
+                    "remaining": remaining,
+                }
+            )
+            write_state(out_state, unresolved, iter_cols)
+            if offset < args.max_iters - 1:
+                await asyncio.sleep(max(args.cooldown_seconds, 1))
+            continue
 
         pending_emails = sorted({unresolved[k]["email"] for k in pending_keys if "@" in unresolved[k]["email"]})
         if not pending_emails:
             stop_reason = "no_pending_emails"
             break
-
-        iter_col = f"iter_{i}_result"
-        iter_cols.append(iter_col)
 
         t0 = time.time()
         verify_map = await verify_emails(
@@ -280,10 +373,17 @@ async def run(args: argparse.Namespace) -> None:
 
         new_deliverable = 0
         new_catch_all = 0
+        verify_miss = 0
 
         for k in pending_keys:
             row = unresolved[k]
-            result = verify_map.get(row["email"], "unknown")
+            result = verify_map.get(row["email"])
+            if result is None:
+                # API miss/disconnect: keep existing state and don't punish unknown streak.
+                verify_miss += 1
+                row[iter_col] = clean(row.get("current_result") or "unknown").lower() or "unknown"
+                continue
+
             row[iter_col] = result
             row["current_result"] = result
             if result in GOOD and not row.get("resolved_iter"):
@@ -293,13 +393,29 @@ async def run(args: argparse.Namespace) -> None:
                 else:
                     new_catch_all += 1
 
+            if result in GOOD:
+                row["unknown_streak"] = "0"
+                row["next_retry_iter"] = ""
+            elif result == "unknown":
+                unknown_streak = parse_int(row.get("unknown_streak"), 0) + 1
+                row["unknown_streak"] = str(unknown_streak)
+                if args.unknown_streak_lock > 0 and unknown_streak >= args.unknown_streak_lock:
+                    retry_gap = max(args.unknown_retry_gap_iters, 1)
+                    row["next_retry_iter"] = str(i + retry_gap)
+                else:
+                    row["next_retry_iter"] = ""
+            else:
+                row["unknown_streak"] = "0"
+                row["next_retry_iter"] = ""
+
         remaining = sum(1 for r in unresolved.values() if r.get("current_result") not in GOOD)
         gains = new_deliverable + new_catch_all
         gain_rate = gains / len(pending_keys) if pending_keys else 0.0
         dt = time.time() - t0
 
         print(
-            f"[reverify] iter={i} pending={len(pending_keys)} emails={len(pending_emails)} "
+            f"[reverify] iter={i} pending={len(all_pending_keys)} eligible={len(pending_keys)} "
+            f"emails={len(pending_emails)} verify_miss={verify_miss} backoff_skipped={backoff_skipped} "
             f"new_deliverable={new_deliverable} new_catch_all={new_catch_all} gains={gains} "
             f"gain_rate={gain_rate:.6f} remaining={remaining} mins={dt/60:.1f}",
             flush=True,
@@ -308,7 +424,11 @@ async def run(args: argparse.Namespace) -> None:
         iter_stats.append(
             {
                 "iter": i,
+                "pending": len(all_pending_keys),
+                "eligible": len(pending_keys),
                 "queried": len(pending_emails),
+                "verify_miss": verify_miss,
+                "backoff_skipped": backoff_skipped,
                 "deliverable": new_deliverable,
                 "catch_all": new_catch_all,
                 "gains": gains,
@@ -330,7 +450,7 @@ async def run(args: argparse.Namespace) -> None:
             low_gain_streak = 0
 
         if (
-            len(pending_keys) >= args.min_pending_for_stop
+            len(all_pending_keys) >= args.min_pending_for_stop
             and low_gain_streak >= args.gain_stop_streak
         ):
             stop_reason = f"low_gain_streak_{low_gain_streak}"
@@ -421,13 +541,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("api_key")
     p.add_argument("--api-url", default="http://127.0.0.1:8025")
     p.add_argument("--batch-size", type=int, default=500)
-    p.add_argument("--concurrency", type=int, default=12)
+    p.add_argument("--concurrency", type=int, default=64)
     p.add_argument("--max-iters", type=int, default=6)
-    p.add_argument("--cooldown-seconds", type=int, default=20)
-    p.add_argument("--gain-stop-abs", type=int, default=50)
-    p.add_argument("--gain-stop-rate", type=float, default=0.0002)
+    p.add_argument("--cooldown-seconds", type=int, default=0)
+    p.add_argument("--gain-stop-abs", type=int, default=40)
+    p.add_argument("--gain-stop-rate", type=float, default=0.00015)
     p.add_argument("--gain-stop-streak", type=int, default=2)
     p.add_argument("--min-pending-for-stop", type=int, default=50000)
+    p.add_argument("--unknown-streak-lock", type=int, default=3)
+    p.add_argument("--unknown-retry-gap-iters", type=int, default=12)
     p.add_argument("--qa-report", default="")
     args = p.parse_args()
     if not args.qa_report:

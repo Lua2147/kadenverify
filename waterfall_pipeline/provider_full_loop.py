@@ -13,8 +13,12 @@ from typing import Callable, Awaitable
 import aiohttp
 import duckdb
 
-from .qa import qa_assert_file, write_qa_report
-from .schema import SchemaValidationError, clean, is_email, read_csv_rows
+try:
+    from .qa import qa_assert_file, write_qa_report
+    from .schema import SchemaValidationError, clean, is_email, read_csv_rows
+except ImportError:  # pragma: no cover
+    from qa import qa_assert_file, write_qa_report
+    from schema import SchemaValidationError, clean, is_email, read_csv_rows
 
 # local helper to avoid importing optional symbol from schema
 

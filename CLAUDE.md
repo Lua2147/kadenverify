@@ -16,6 +16,8 @@ python batch_verify.py     # Bulk verification (email-only)
 python batch_process.py run ./contacts/  # Full pipeline: find → verify → squeeze → xlsx
 python batch_process.py export state.csv -o results.xlsx  # Re-export from state
 python batch_process.py stats state.csv  # Show stats from state
+python cli.py waterfall orchestrate --run-dir <run_dir> --kadenverify-api-key <key>  # Waterfall full loop
+python cli.py waterfall queue-round2 --run-dir <run_dir> --kadenverify-api-key <key> --wait-reverify
 ```
 
 ## 3-Tier Verification
