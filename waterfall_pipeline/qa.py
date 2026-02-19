@@ -4,15 +4,26 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .schema import (
-    PERSON_HEADERS_30,
-    SchemaValidationError,
-    count_token_hits,
-    detect_email_column,
-    ensure_required_headers,
-    is_email,
-    read_csv_rows,
-)
+try:
+    from .schema import (
+        PERSON_HEADERS_30,
+        SchemaValidationError,
+        count_token_hits,
+        detect_email_column,
+        ensure_required_headers,
+        is_email,
+        read_csv_rows,
+    )
+except ImportError:  # pragma: no cover
+    from schema import (
+        PERSON_HEADERS_30,
+        SchemaValidationError,
+        count_token_hits,
+        detect_email_column,
+        ensure_required_headers,
+        is_email,
+        read_csv_rows,
+    )
 
 
 @dataclass

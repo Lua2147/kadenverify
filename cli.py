@@ -10,6 +10,7 @@ Commands:
 import asyncio
 import json
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -226,6 +227,23 @@ def stats(verified_db: str):
             click.echo(f"  {d['domain']}: {d['count']}")
 
     conn.close()
+
+
+@main.command(
+    "waterfall",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.argument("runner_args", nargs=-1, type=click.UNPROCESSED)
+def waterfall(runner_args: tuple[str, ...]):
+    """Run the reusable waterfall pipeline runner.
+
+    Example:
+      python cli.py waterfall orchestrate --run-dir /path/to/run --kadenverify-api-key <key>
+    """
+    cmd = [sys.executable, "-m", "waterfall_pipeline.runner", *runner_args]
+    rc = subprocess.call(cmd, cwd=str(Path(__file__).parent))
+    if rc != 0:
+        raise click.ClickException(f"waterfall runner failed with exit code {rc}")
 
 
 def _read_email_file(filepath: str) -> list[str]:

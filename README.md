@@ -161,6 +161,22 @@ python cli.py pipeline --source-path contacts.duckdb --limit 10000
 python cli.py stats
 ```
 
+### Waterfall Pipeline (Resumable, In-Repo)
+
+```bash
+# End-to-end: split stage1 -> provider waterfall -> reverify -> final merge
+python cli.py waterfall orchestrate \
+  --run-dir /data/local-machine-backup/20260211/email-verifier-runs/tier1_tier2_v2_fullloop_20260211 \
+  --kadenverify-api-key "$KADENVERIFY_API_KEY" \
+  --wait-stage1
+
+# Queue unresolved round2 provider pass after reverify completes
+python cli.py waterfall queue-round2 \
+  --run-dir /data/local-machine-backup/20260211/email-verifier-runs/tier1_tier2_v2_fullloop_20260211 \
+  --kadenverify-api-key "$KADENVERIFY_API_KEY" \
+  --wait-reverify
+```
+
 **Output:**
 ```
 Total verified emails: 250,000

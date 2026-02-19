@@ -142,6 +142,8 @@ async def run_orchestrate(args: argparse.Namespace) -> None:
                 gain_stop_rate=args.gain_stop_rate,
                 gain_stop_streak=args.gain_stop_streak,
                 min_pending_for_stop=args.min_pending_for_stop,
+                unknown_streak_lock=args.reverify_unknown_streak_lock,
+                unknown_retry_gap_iters=args.reverify_unknown_retry_gap_iters,
                 qa_report=str(provider_dir / "provider_reverify_qa.json"),
             )
         )
@@ -245,13 +247,15 @@ def build_parser() -> argparse.ArgumentParser:
     orch.add_argument("--skip-low-yield", action="store_true")
     orch.add_argument("--min-stage-yield", type=float, default=0.0005)
     orch.add_argument("--reverify-batch-size", type=int, default=500)
-    orch.add_argument("--reverify-concurrency", type=int, default=12)
+    orch.add_argument("--reverify-concurrency", type=int, default=64)
     orch.add_argument("--reverify-max-iters", type=int, default=6)
-    orch.add_argument("--reverify-cooldown-seconds", type=int, default=20)
-    orch.add_argument("--gain-stop-abs", type=int, default=50)
-    orch.add_argument("--gain-stop-rate", type=float, default=0.0002)
+    orch.add_argument("--reverify-cooldown-seconds", type=int, default=0)
+    orch.add_argument("--gain-stop-abs", type=int, default=40)
+    orch.add_argument("--gain-stop-rate", type=float, default=0.00015)
     orch.add_argument("--gain-stop-streak", type=int, default=2)
     orch.add_argument("--min-pending-for-stop", type=int, default=50000)
+    orch.add_argument("--reverify-unknown-streak-lock", type=int, default=3)
+    orch.add_argument("--reverify-unknown-retry-gap-iters", type=int, default=12)
     orch.add_argument("--output-csv", default="quick_wins_plus_catchall_fullloop.csv")
     orch.add_argument("--output-summary", default="quick_wins_plus_catchall_fullloop_summary.txt")
     orch.add_argument("--poll-seconds", type=int, default=60)

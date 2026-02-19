@@ -11,16 +11,28 @@ from urllib.parse import quote
 import duckdb
 import requests
 
-from .qa import qa_assert_zero_overlap, write_qa_report
-from .schema import (
-    PERSON_HEADERS_30,
-    PLACEHOLDER_TOKENS,
-    apply_row_defaults,
-    clean,
-    count_token_hits,
-    detect_email_column,
-    is_email,
-)
+try:
+    from .qa import qa_assert_zero_overlap, write_qa_report
+    from .schema import (
+        PERSON_HEADERS_30,
+        PLACEHOLDER_TOKENS,
+        apply_row_defaults,
+        clean,
+        count_token_hits,
+        detect_email_column,
+        is_email,
+    )
+except ImportError:  # pragma: no cover
+    from qa import qa_assert_zero_overlap, write_qa_report
+    from schema import (
+        PERSON_HEADERS_30,
+        PLACEHOLDER_TOKENS,
+        apply_row_defaults,
+        clean,
+        count_token_hits,
+        detect_email_column,
+        is_email,
+    )
 
 
 def parse_token(token_file: Path) -> str:
