@@ -17,13 +17,13 @@ from .models import SmtpResponse
 logger = logging.getLogger("kadenverify.smtp")
 
 # Defaults
-DEFAULT_HELO_DOMAIN = "198-23-249-137-host.colocrossing.com"
-DEFAULT_FROM_ADDRESS = "postmaster@198-23-249-137-host.colocrossing.com"
-CONNECT_TIMEOUT = 10
-COMMAND_TIMEOUT = 10
-TOTAL_TIMEOUT = 45
-GREYLIST_DELAY = 35
-GREYLIST_RETRIES = 2
+DEFAULT_HELO_DOMAIN = "verify.kadenwood.com"
+DEFAULT_FROM_ADDRESS = "verify@kadenwood.com"
+CONNECT_TIMEOUT = 1  # Turbo profile
+COMMAND_TIMEOUT = 1  # Turbo profile
+TOTAL_TIMEOUT = 4   # Turbo profile
+GREYLIST_DELAY = 30  # Not used if RETRIES = 0
+GREYLIST_RETRIES = 0  # Skip retries for speed - mark unknown instead
 SMTP_PORT = 25
 
 
@@ -130,7 +130,7 @@ async def smtp_check(
                     return parse_smtp_response(code, message)
 
             # Try STARTTLS if available (best effort, don't fail if unavailable)
-            if "STARTTLS" in message.upper():
+            if False and "STARTTLS" in message.upper():
                 try:
                     tls_code, tls_msg = await _send_command(writer, reader, "STARTTLS", command_timeout)
                     if tls_code == 220:
@@ -292,7 +292,7 @@ async def smtp_check_batch(
                 return [await smtp_check(email, mx_host, helo_domain, from_address, port) for email in emails]
 
         # STARTTLS (best effort, skip if fails)
-        if "STARTTLS" in message.upper():
+        if False and "STARTTLS" in message.upper():
             try:
                 tls_code, tls_msg = await _send_command(writer, reader, "STARTTLS", command_timeout)
                 if tls_code == 220:

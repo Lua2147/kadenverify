@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import requests
@@ -189,6 +190,12 @@ class SupabaseRestClient:
     def upsert_result(self, result: VerificationResult) -> None:
         self.upsert_results_batch([result], batch_size=1)
 
+    @staticmethod
+    def _normalize_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     def upsert_results_batch(self, results: list[VerificationResult], batch_size: int = 500) -> int:
         """Upsert verification results by email primary key.
 
@@ -201,7 +208,12 @@ class SupabaseRestClient:
         written = 0
         for i in range(0, len(results), batch_size):
             chunk = results[i : i + batch_size]
-            payload = [r.model_dump(mode="json") for r in chunk]
+            payload = []
+            for r in chunk:
+                verified_at = self._normalize_utc(r.verified_at)
+                if verified_at is not r.verified_at:
+                    r = r.model_copy(update={"verified_at": verified_at})
+                payload.append(r.model_dump(mode="json"))
             self._request(
                 "POST",
                 f"/{self._table}",

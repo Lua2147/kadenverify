@@ -257,20 +257,12 @@ async def verify_batch(
 
     await asyncio.gather(*[_resolve_domain(d) for d in unique_domains], return_exceptions=True)
 
-    # Domain-level lock to prevent simultaneous connections to same MX
-    domain_locks: dict[str, asyncio.Lock] = {}
-
     async def _verify_with_limit(email: str) -> VerificationResult:
-        # Extract domain for domain-level locking
         parts = email.strip().split("@")
         domain = parts[-1].lower() if len(parts) == 2 else ""
 
-        # Get or create domain lock
-        if domain not in domain_locks:
-            domain_locks[domain] = asyncio.Lock()
-
         async with semaphore:
-            async with domain_locks[domain]:
+            try:
                 result = await verify_email(
                     email=email,
                     helo_domain=helo_domain,
@@ -278,13 +270,23 @@ async def verify_batch(
                     dns_cache=dns_cache,
                     catch_all_cache=catch_all_cache,
                 )
-                if progress_callback:
-                    progress_callback(result)
-                return result
+            except Exception:
+                logger.exception("Verification failed for %s", email)
+                result = VerificationResult(
+                    email=email,
+                    normalized=email.strip().lower(),
+                    reachability=Reachability.unknown,
+                    is_deliverable=None,
+                    domain=domain,
+                    error="internal verification error",
+                )
+            if progress_callback:
+                progress_callback(result)
+            return result
 
-    # Sort emails by domain for better cache utilization
+    # Preserve input order. Domain-level locks still provide MX safety while
+    # allowing mixed-domain work to utilize concurrency.
     indexed_emails = list(enumerate(emails))
-    indexed_emails.sort(key=lambda x: x[1].split("@")[-1] if "@" in x[1] else "")
 
     # Run all verifications
     tasks = [_verify_with_limit(email) for _, email in indexed_emails]

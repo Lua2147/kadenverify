@@ -11,5 +11,4 @@ slowapi>=0.1
 streamlit>=1.31
 pandas>=2.0
 requests>=2.31
-openpyxl>=3.1
-aiohttp>=3.9
+redis>=5.0

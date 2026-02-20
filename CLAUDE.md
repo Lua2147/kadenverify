@@ -12,10 +12,7 @@ Python, FastAPI, DuckDB
 python cli.py              # CLI verification
 python server.py           # Start API server
 python dashboard.py        # Monitoring dashboard
-python batch_verify.py     # Bulk verification (email-only)
-python batch_process.py run ./contacts/  # Full pipeline: find → verify → squeeze → xlsx
-python batch_process.py export state.csv -o results.xlsx  # Re-export from state
-python batch_process.py stats state.csv  # Show stats from state
+python batch_verify.py     # Bulk verification
 ```
 
 ## 3-Tier Verification
@@ -30,17 +27,6 @@ python batch_process.py stats state.csv  # Show stats from state
 - `POST /v1/verify` — Batch verification (up to 1000)
 
 OmniVerifier-compatible response format (drop-in replacement).
-
-## Batch Processor (`batch_process.py`)
-
-End-to-end contact file processing: xlsx/csv in → find missing emails → verify → squeeze → xlsx out.
-
-- Ingests PitchBook xlsx, generic xlsx, or csv (auto-detects column names)
-- Splits contacts: has-email → verify, missing-email → find via waterfall then verify
-- Iterative squeeze: re-verifies risky/unknown until dry (SMTP greylisting timer exploit)
-- Preserves all contact metadata (name, company, position, phone, LinkedIn, etc.)
-- Exports formatted xlsx with sheets: Summary, Deliverable, All Usable, All Contacts, No Email
-- Saves state.csv for resume/re-export
 
 ## Features
 

@@ -7,7 +7,7 @@ from pathlib import Path
 _LISTS_DIR = Path(__file__).parent.parent / "lists"
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=8)
 def _load_set(filename: str) -> frozenset[str]:
     """Load a newline-delimited text file into a frozenset."""
     filepath = _LISTS_DIR / filename
@@ -83,3 +83,6 @@ def classify(local_part: str, domain: str) -> dict:
         "is_role": is_role_account(local_part),
         "is_free": is_free_provider(domain),
     }
+
+# Warm list caches once at import for high-concurrency workloads
+_ = disposable_domains(), free_providers(), role_prefixes()

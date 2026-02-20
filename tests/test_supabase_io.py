@@ -194,3 +194,23 @@ def test_supabase_query_rows_passes_filters_and_order() -> None:
     assert calls[0]["params"]["reachability"] == "eq.safe"
     assert calls[0]["params"]["order"] == "verified_at.desc"
     assert calls[0]["params"]["limit"] == "123"
+
+
+def test_supabase_upsert_normalizes_naive_verified_at() -> None:
+    from store.supabase_io import SupabaseRestClient
+
+    payloads = []
+
+    def fake_request(method, url, headers=None, params=None, json=None, timeout=None):
+        payloads.append(json)
+        return _FakeResponse(201, [])
+
+    client = SupabaseRestClient("https://example.supabase.co", "test-key", request_fn=fake_request)
+
+    naive = datetime(2026, 2, 9, 0, 0, 0)  # naive -> should be treated as UTC
+    result = VerificationResult(email="a@example.com", normalized="a@example.com", verified_at=naive)
+
+    client.upsert_results_batch([result], batch_size=10)
+
+    sent = payloads[0][0]["verified_at"]
+    assert sent.endswith("+00:00") or sent.endswith("Z")

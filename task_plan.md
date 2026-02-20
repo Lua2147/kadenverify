@@ -4,38 +4,38 @@
 Migrate the app’s persistent state from local DuckDB/Redis to Supabase Postgres (and ship a safe migration path for existing `verified.duckdb` data), while preserving API contracts.
 
 ## Current Phase
-Phase 1
+Phase 4
 
 ## Phases
 
 ### Phase 1: Requirements & Discovery
-- [ ] Confirm scope of “migrate everything” (API cache, /stats, CLI pipeline, Streamlit dashboard, rate limiting, metrics)
-- [ ] Confirm target Supabase project + auth method (service role key vs DB connection string)
-- [ ] Inventory current state usage (DuckDB cache, verified results DB, Redis rate limiting/cache options)
-- [ ] Document findings + constraints in findings.md
-- **Status:** in_progress
+- [x] Confirm scope of “migrate everything” (API cache, /stats, CLI pipeline, Streamlit dashboard, rate limiting, metrics)
+- [x] Confirm target Supabase project + auth method (service role key vs DB connection string)
+- [x] Inventory current state usage (DuckDB cache, verified results DB, Redis rate limiting/cache options)
+- [x] Document findings + constraints in findings.md
+- **Status:** complete
 
 ### Phase 2: Schema & Design
-- [ ] Define canonical `verified_emails` schema for Supabase (include `error`, `verified_at`, indexes)
-- [ ] Decide access pattern for runtime (PostgREST vs direct Postgres) + connection management
-- [ ] Decide behavior on Supabase outage (fallback, degraded readiness, caching)
-- [ ] Define migration strategy from `verified.duckdb` (idempotent upsert, batching, resume)
-- **Status:** pending
+- [x] Define canonical `verified_emails` schema for Supabase (include `error`, `verified_at`, indexes)
+- [x] Decide access pattern for runtime (PostgREST via `requests` + async `to_thread`)
+- [x] Decide behavior on Supabase outage (readiness shows degraded; cache lookup/update best-effort)
+- [x] Define migration strategy from `verified.duckdb` (idempotent upsert, batching)
+- **Status:** complete
 
 ### Phase 3: Implementation
-- [ ] Add Supabase backend for cache read/write
-- [ ] Update `/stats` to query Supabase (and/or provide compatibility mode)
-- [ ] Update CLI pipeline + CLI stats to support Supabase target
-- [ ] Add migration script: DuckDB -> Supabase table
-- [ ] Update docs/deploy (`deploy.sh`, env vars)
-- **Status:** pending
+- [x] Add Supabase backend for cache read/write
+- [x] Update `/stats` to query Supabase when enabled
+- [x] Update CLI pipeline + CLI stats to support Supabase target
+- [x] Add migration command + SQL migration for table
+- [x] Update docs/deploy (`deploy.sh`, docker env vars)
+- **Status:** complete
 
 ### Phase 4: Testing & Verification
-- [ ] Unit tests: Supabase backend behavior (mock HTTP/DB)
-- [ ] Verify existing API contract tests still pass
-- [ ] Verify migration script on sample dataset (dry-run mode)
-- [ ] Document verification results in progress.md
-- **Status:** pending
+- [x] Unit tests: Supabase backend behavior (mock HTTP/DB)
+- [x] Verify existing API contract tests still pass
+- [ ] Verify migration command against a real Supabase project
+- [x] Document verification results in progress.md
+- **Status:** in_progress
 
 ### Phase 5: Delivery
 - [ ] Commit + push

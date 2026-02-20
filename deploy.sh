@@ -18,10 +18,15 @@ fi
 INSTALL_DIR="/opt/kadenverify"
 REPO_URL="https://github.com/Lua2147/kadenverify.git"
 PYTHON_CMD="python3"
+APP_USER="kadenverify"
+APP_GROUP="kadenverify"
+ENV_DIR="/etc/kadenverify"
+ENV_FILE="$ENV_DIR/kadenverify.env"
 
 echo "📋 Configuration:"
 echo "  Install dir: $INSTALL_DIR"
 echo "  Repository: $REPO_URL"
+echo "  Service user: $APP_USER"
 echo ""
 
 # Step 1: Install dependencies
@@ -39,6 +44,14 @@ else
   git clone "$REPO_URL" "$INSTALL_DIR"
   cd "$INSTALL_DIR"
 fi
+
+# Step 2.5: Create service user
+if ! id -u "$APP_USER" >/dev/null 2>&1; then
+  echo "👤 Creating service user: $APP_USER"
+  useradd --system --create-home --home-dir /home/$APP_USER --shell /usr/sbin/nologin "$APP_USER"
+fi
+
+mkdir -p "$ENV_DIR"
 
 # Step 3: Create virtual environment
 echo "🐍 Setting up Python virtual environment..."
@@ -64,19 +77,45 @@ if [ ! -f "config.json" ]; then
   nano config.json
 fi
 
+# Ensure app directory owned by service user
+chown -R "$APP_USER:$APP_GROUP" "$INSTALL_DIR"
+chmod 750 "$INSTALL_DIR"
+
+# Environment file for secrets/config
+if [ ! -f "$ENV_FILE" ]; then
+  echo "📝 Creating secure environment file..."
+  read -p "Enter API key (used by API auth): " api_key
+  read -p "Enter Supabase URL (https://...supabase.co): " supabase_url
+  read -s -p "Enter Supabase service role key: " supabase_key
+  echo ""
+  cat > "$ENV_FILE" <<EOF
+KADENVERIFY_API_KEY=$api_key
+KADENVERIFY_HELO_DOMAIN=verify.kadenwood.com
+KADENVERIFY_FROM_ADDRESS=verify@kadenwood.com
+KADENVERIFY_CONCURRENCY=50
+KADENVERIFY_RATE_LIMIT_BACKEND=redis
+KADENVERIFY_CACHE_BACKEND=supabase
+KADENVERIFY_SUPABASE_URL=$supabase_url
+KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY=$supabase_key
+EOF
+fi
+chown root:"$APP_GROUP" "$ENV_FILE"
+chmod 640 "$ENV_FILE"
+
 # Check if .streamlit/secrets.toml exists
 mkdir -p .streamlit
 if [ ! -f ".streamlit/secrets.toml" ]; then
   echo "📝 Creating Streamlit secrets..."
-  read -p "Enter API key (same as in config.json): " api_key
+  api_key=$(grep '^KADENVERIFY_API_KEY=' "$ENV_FILE" | cut -d= -f2-)
   echo "KADENVERIFY_API_KEY = \"$api_key\"" > .streamlit/secrets.toml
   chmod 600 .streamlit/secrets.toml
 fi
+chown -R "$APP_USER:$APP_GROUP" "$INSTALL_DIR/.streamlit"
 
 # Step 5: Test verification
 echo "🧪 Testing verification..."
 echo "Testing: python3 cli.py verify test@gmail.com"
-$PYTHON_CMD cli.py verify test@gmail.com || {
+runuser -u "$APP_USER" -- $PYTHON_CMD cli.py verify test@gmail.com || {
   echo "⚠️  Warning: Verification test failed. Port 25 might be blocked."
   echo "Continue anyway? (y/n)"
   read -r continue
@@ -96,8 +135,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=$APP_USER
+Group=$APP_GROUP
 WorkingDirectory=$INSTALL_DIR
+EnvironmentFile=$ENV_FILE
 Environment="PATH=$INSTALL_DIR/venv/bin"
 ExecStart=$INSTALL_DIR/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8025
 Restart=always
@@ -115,8 +156,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=$APP_USER
+Group=$APP_GROUP
 WorkingDirectory=$INSTALL_DIR
+EnvironmentFile=$ENV_FILE
 Environment="PATH=$INSTALL_DIR/venv/bin"
 ExecStart=$INSTALL_DIR/venv/bin/streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0
 Restart=always

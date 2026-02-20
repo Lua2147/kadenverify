@@ -583,193 +583,195 @@ def main():
     with tab4:
         st.header("💾 Database Results - All Verifications")
 
-        try:
-            import duckdb
-            from pathlib import Path
+        from datetime import timedelta, timezone
 
-            # Connect to database
-            db_path = Path(__file__).parent / "verified.duckdb"
+        from engine.models import Provider
+        from store.supabase_io import supabase_client_from_env
 
-            if not db_path.exists():
-                st.warning("No database found. Run some verifications first!")
+        supa = supabase_client_from_env()
+        if supa is None:
+            st.error(
+                "Supabase store not configured. Set environment variables "
+                "`KADENVERIFY_SUPABASE_URL` and `KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY`."
+            )
+        else:
+            try:
+                stats = supa.get_stats()
+                total = int(stats.get("total") or 0)
+            except Exception as e:
+                st.error(f"Supabase error: {e}")
+                st.exception(e)
+                total = 0
+                stats = {"by_reachability": {}, "catch_all": 0, "disposable": 0}
+
+            if total == 0:
+                st.info("Supabase store is empty. Run some verifications to populate it!")
             else:
-                conn = duckdb.connect(str(db_path), read_only=True)
+                st.success(f"📊 **{total:,} emails** verified in Supabase")
 
-                # Get total count
-                total = conn.execute("SELECT COUNT(*) FROM verified_emails").fetchone()[0]
+                # Date range (two lightweight queries)
+                first_rows = supa.query_rows(select="verified_at", order="verified_at.asc", limit=1)
+                last_rows = supa.query_rows(select="verified_at", order="verified_at.desc", limit=1)
+                first_verified = first_rows[0].get("verified_at") if first_rows else None
+                last_verified = last_rows[0].get("verified_at") if last_rows else None
 
-                if total == 0:
-                    st.info("Database is empty. Run some verifications to populate it!")
-                else:
-                    st.success(f"📊 **{total:,} emails** verified in database")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("First Verification", str(first_verified)[:19] if first_verified else "N/A")
+                with col2:
+                    st.metric("Last Verification", str(last_verified)[:19] if last_verified else "N/A")
 
-                    # Date range
-                    date_range = conn.execute("""
-                        SELECT
-                            MIN(verified_at) as first_verification,
-                            MAX(verified_at) as last_verification
-                        FROM verified_emails
-                    """).fetchone()
+                st.divider()
 
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("First Verification", str(date_range[0])[:19] if date_range[0] else "N/A")
-                    with col2:
-                        st.metric("Last Verification", str(date_range[1])[:19] if date_range[1] else "N/A")
-
-                    st.divider()
-
-                    # Summary stats
-                    st.subheader("📈 Summary Statistics")
-
-                    stats_df = conn.execute("""
-                        SELECT
-                            reachability,
-                            COUNT(*) as count,
-                            ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) as percentage
-                        FROM verified_emails
-                        GROUP BY reachability
-                        ORDER BY count DESC
-                    """).df()
-
-                    # Display as columns
-                    cols = st.columns(len(stats_df))
-                    for idx, row in stats_df.iterrows():
-                        with cols[idx]:
-                            status = row['reachability']
-                            count = row['count']
-                            pct = row['percentage']
-
-                            # Color based on status
-                            if status == 'safe':
-                                color = "#10b981"
-                            elif status == 'risky':
-                                color = "#f59e0b"
-                            elif status == 'invalid':
-                                color = "#dc2626"
-                            else:
-                                color = "#64748b"
-
-                            st.markdown(f"""
-                            <div class="stat-box" style="background: {color};">
-                                <div class="stat-number">{count}</div>
-                                <div class="stat-label">{status.upper()} ({pct}%)</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                    st.divider()
-
-                    # Filters
-                    st.subheader("🔍 Filters")
-
-                    col1, col2, col3 = st.columns(3)
-
-                    with col1:
-                        status_filter_db = st.multiselect(
-                            "Status",
-                            options=['safe', 'risky', 'invalid', 'unknown'],
-                            default=[],
-                            key="db_status_filter"
-                        )
-
-                    with col2:
-                        # Get unique providers
-                        providers = conn.execute("""
-                            SELECT DISTINCT provider
-                            FROM verified_emails
-                            WHERE provider IS NOT NULL
-                            ORDER BY provider
-                        """).df()['provider'].tolist()
-
-                        provider_filter_db = st.multiselect(
-                            "Provider",
-                            options=providers,
-                            default=[],
-                            key="db_provider_filter"
-                        )
-
-                    with col3:
-                        # Date filter
-                        days_back = st.selectbox(
-                            "Time Period",
-                            options=[("All Time", 9999), ("Last 24 Hours", 1), ("Last 7 Days", 7), ("Last 30 Days", 30)],
-                            format_func=lambda x: x[0],
-                            key="db_date_filter"
-                        )
-
-                    # Build query
-                    query = "SELECT * FROM verified_emails WHERE 1=1"
-
-                    if status_filter_db:
-                        status_list = "', '".join(status_filter_db)
-                        query += f" AND reachability IN ('{status_list}')"
-
-                    if provider_filter_db:
-                        provider_list = "', '".join(provider_filter_db)
-                        query += f" AND provider IN ('{provider_list}')"
-
-                    if days_back[1] < 9999:
-                        query += f" AND verified_at > NOW() - INTERVAL '{days_back[1]} days'"
-
-                    query += " ORDER BY verified_at DESC LIMIT 10000"
-
-                    # Load results
-                    results_df = conn.execute(query).df()
-
-                    st.subheader(f"📋 Results ({len(results_df):,} emails)")
-
-                    # Show data
-                    st.dataframe(
-                        results_df,
-                        use_container_width=True,
-                        height=500,
-                        column_config={
-                            "verified_at": st.column_config.DatetimeColumn(
-                                "Verified At",
-                                format="YYYY-MM-DD HH:mm:ss"
-                            ),
-                            "is_deliverable": st.column_config.CheckboxColumn("Deliverable"),
-                            "is_catch_all": st.column_config.CheckboxColumn("Catch-all"),
-                            "is_disposable": st.column_config.CheckboxColumn("Disposable"),
-                            "is_role": st.column_config.CheckboxColumn("Role"),
-                            "is_free": st.column_config.CheckboxColumn("Free"),
+                # Summary stats
+                st.subheader("📈 Summary Statistics")
+                by_reachability = stats.get("by_reachability", {}) or {}
+                stats_rows = []
+                for reachability, count in by_reachability.items():
+                    count_int = int(count or 0)
+                    pct = round((count_int / total) * 100.0, 1) if total else 0.0
+                    stats_rows.append(
+                        {
+                            "reachability": reachability,
+                            "count": count_int,
+                            "percentage": pct,
                         }
                     )
+                stats_df = pd.DataFrame(stats_rows).sort_values("count", ascending=False) if stats_rows else pd.DataFrame(
+                    columns=["reachability", "count", "percentage"]
+                )
 
-                    # Download button
-                    csv = results_df.to_csv(index=False)
-                    st.download_button(
-                        label=f"💾 Download {len(results_df):,} Results (CSV)",
-                        data=csv,
-                        file_name=f"kadenverify_database_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
+                cols = st.columns(max(1, len(stats_df)))
+                for idx, row in stats_df.iterrows():
+                    with cols[idx]:
+                        status = row["reachability"]
+                        count = row["count"]
+                        pct = row["percentage"]
+
+                        if status == "safe":
+                            color = "#10b981"
+                        elif status == "risky":
+                            color = "#f59e0b"
+                        elif status == "invalid":
+                            color = "#dc2626"
+                        else:
+                            color = "#64748b"
+
+                        st.markdown(
+                            f"""
+                            <div class="stat-box" style="background: {color};">
+                                <div class="stat-number">{count}</div>
+                                <div class="stat-label">{str(status).upper()} ({pct}%)</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                st.divider()
+
+                # Filters
+                st.subheader("🔍 Filters")
+
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    status_filter_db = st.multiselect(
+                        "Status",
+                        options=["safe", "risky", "invalid", "unknown"],
+                        default=[],
+                        key="db_status_filter",
                     )
 
-                    # Provider breakdown
-                    with st.expander("📊 Provider Breakdown"):
-                        provider_stats = conn.execute("""
-                            SELECT
-                                provider,
-                                COUNT(*) as total,
-                                SUM(CASE WHEN is_deliverable THEN 1 ELSE 0 END) as deliverable,
-                                ROUND(AVG(CASE WHEN is_deliverable THEN 100.0 ELSE 0.0 END), 1) as deliverable_rate
-                            FROM verified_emails
-                            WHERE provider IS NOT NULL
-                            GROUP BY provider
-                            ORDER BY total DESC
-                            LIMIT 20
-                        """).df()
+                with col2:
+                    provider_options = [p.value for p in Provider]
+                    provider_filter_db = st.multiselect(
+                        "Provider",
+                        options=provider_options,
+                        default=[],
+                        key="db_provider_filter",
+                    )
 
-                        st.dataframe(provider_stats, use_container_width=True, hide_index=True)
+                with col3:
+                    days_back = st.selectbox(
+                        "Time Period",
+                        options=[
+                            ("All Time", 9999),
+                            ("Last 24 Hours", 1),
+                            ("Last 7 Days", 7),
+                            ("Last 30 Days", 30),
+                        ],
+                        format_func=lambda x: x[0],
+                        key="db_date_filter",
+                    )
 
-                conn.close()
+                filters: dict[str, str] = {}
+                if status_filter_db:
+                    filters["reachability"] = f"in.({','.join(status_filter_db)})"
+                if provider_filter_db:
+                    filters["provider"] = f"in.({','.join(provider_filter_db)})"
+                if days_back[1] < 9999:
+                    start = datetime.now(timezone.utc) - timedelta(days=int(days_back[1]))
+                    filters["verified_at"] = f"gt.{start.isoformat()}"
 
-        except ImportError:
-            st.error("DuckDB not installed. Run: pip install duckdb")
-        except Exception as e:
-            st.error(f"Database error: {e}")
-            st.exception(e)
+                rows = supa.query_rows(filters=filters, order="verified_at.desc", limit=10000)
+                results_df = pd.DataFrame(rows)
+
+                st.subheader(f"📋 Results ({len(results_df):,} emails)")
+                st.dataframe(
+                    results_df,
+                    use_container_width=True,
+                    height=500,
+                    column_config={
+                        "verified_at": st.column_config.DatetimeColumn(
+                            "Verified At",
+                            format="YYYY-MM-DD HH:mm:ss",
+                        ),
+                        "is_deliverable": st.column_config.CheckboxColumn("Deliverable"),
+                        "is_catch_all": st.column_config.CheckboxColumn("Catch-all"),
+                        "is_disposable": st.column_config.CheckboxColumn("Disposable"),
+                        "is_role": st.column_config.CheckboxColumn("Role"),
+                        "is_free": st.column_config.CheckboxColumn("Free"),
+                    },
+                )
+
+                csv = results_df.to_csv(index=False)
+                st.download_button(
+                    label=f"💾 Download {len(results_df):,} Results (CSV)",
+                    data=csv,
+                    file_name=f"kadenverify_database_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+                with st.expander("📊 Provider Breakdown"):
+                    provider_rows = []
+                    for provider in [p.value for p in Provider]:
+                        provider_total = supa.count(filters={"provider": f"eq.{provider}"})
+                        if provider_total <= 0:
+                            continue
+                        deliverable = supa.count(
+                            filters={
+                                "provider": f"eq.{provider}",
+                                "is_deliverable": "is.true",
+                            }
+                        )
+                        rate = round((deliverable / provider_total) * 100.0, 1) if provider_total else 0.0
+                        provider_rows.append(
+                            {
+                                "provider": provider,
+                                "total": provider_total,
+                                "deliverable": deliverable,
+                                "deliverable_rate": rate,
+                            }
+                        )
+                    provider_df = (
+                        pd.DataFrame(provider_rows)
+                        .sort_values("total", ascending=False)
+                        .head(20)
+                        if provider_rows
+                        else pd.DataFrame(columns=["provider", "total", "deliverable", "deliverable_rate"])
+                    )
+                    st.dataframe(provider_df, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":

@@ -33,26 +33,26 @@ logger = logging.getLogger("kadenverify.batch")
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 
-DEFAULT_API_URL = os.environ.get("KADENVERIFY_API_URL", "http://198.23.249.137:8025")
+DEFAULT_API_URL = os.environ.get("KADENVERIFY_API_URL", "http://149.28.37.34:8025")
 DEFAULT_API_KEY = os.environ.get("KADENVERIFY_API_KEY", "")  # pragma: allowlist secret
 
 FIND_BATCH_SIZE = 50
 FIND_CONCURRENCY = 6
-VERIFY_BATCH_SIZE = 50
-VERIFY_CONCURRENCY = 10
+VERIFY_BATCH_SIZE = 200
+VERIFY_CONCURRENCY = 4
 SQUEEZE_COOLDOWN = 20
 MAX_SQUEEZE_ITERATIONS = 14
 
 # ── Column mapping (PitchBook xlsx conventions) ─────────────────────────────
 
-NAME_COLUMNS = ["Full Name", "full_name", "Name", "name", "Contact Name", "Contact Full Name", "member_full_name"]
-FIRST_NAME_COLUMNS = ["First Name", "first_name", "FirstName", "Contact First Name", "member_name_first"]
-LAST_NAME_COLUMNS = ["Last Name", "last_name", "LastName", "Contact Last Name", "member_name_last"]
-EMAIL_COLUMNS = ["Email Address", "Email", "email", "email_address", "Work Email", "Contact Primary E-mail Address", "E-mail Address"]
-COMPANY_COLUMNS = ["Primary Company", "Company", "company", "Organization", "Company Name", "company_name"]
-WEBSITE_COLUMNS = ["Primary Company Website", "Website", "website", "Domain", "Company Website", "Company Website", "domain"]
-POSITION_COLUMNS = ["Primary Title", "Title", "Position", "Job Title", "title", "position", "job_title", "Contact Title"]
-PHONE_COLUMNS = ["Phone", "phone", "Phone Number", "Direct Phone", "Contact Primary Phone Number"]
+NAME_COLUMNS = ["Full Name", "full_name", "Name", "name", "Contact Name"]
+FIRST_NAME_COLUMNS = ["First Name", "first_name", "FirstName"]
+LAST_NAME_COLUMNS = ["Last Name", "last_name", "LastName"]
+EMAIL_COLUMNS = ["Email Address", "Email", "email", "email_address", "Work Email"]
+COMPANY_COLUMNS = ["Primary Company", "Company", "company", "Organization", "Company Name"]
+WEBSITE_COLUMNS = ["Primary Company Website", "Website", "website", "Domain", "Company Website"]
+POSITION_COLUMNS = ["Primary Title", "Title", "Position", "Job Title", "title", "position"]
+PHONE_COLUMNS = ["Phone", "phone", "Phone Number", "Direct Phone"]
 LINKEDIN_COLUMNS = ["LinkedIn", "linkedin", "LinkedIn URL", "LinkedIn Profile"]
 LOCATION_COLUMNS = ["Location", "location", "City", "Geography"]
 PROFILE_COLUMNS = ["Profile URL", "PitchBook Profile", "URL"]
@@ -99,27 +99,7 @@ def load_contacts_from_file(filepath: Path) -> list[dict]:
         import openpyxl
 
         wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-        # Try to find the best sheet: prefer "Contacts" by name, then most contact-like columns
         ws = wb.active
-        if len(wb.sheetnames) > 1:
-            # First: look for a sheet literally named "Contacts"
-            for sheet_name in wb.sheetnames:
-                if sheet_name.lower() == "contacts":
-                    ws = wb[sheet_name]
-                    break
-            else:
-                # Fallback: pick the sheet with the most contact-related columns
-                best_score, best_ws = -1, None
-                for sheet_name in wb.sheetnames:
-                    candidate = wb[sheet_name]
-                    first_row = next(candidate.iter_rows(min_row=1, max_row=1, values_only=True), None)
-                    if first_row:
-                        hdrs = [str(h).strip().lower() for h in first_row if h]
-                        score = sum(1 for h in hdrs for kw in ["email", "e-mail", "first name", "last name", "full name"] if kw in h)
-                        if score > best_score:
-                            best_score, best_ws = score, candidate
-                if best_ws is not None:
-                    ws = best_ws
         rows = list(ws.iter_rows(min_row=1, values_only=True))
         wb.close()
         if not rows:
@@ -510,10 +490,12 @@ def export_xlsx(contacts: list[dict], output_path: Path):
     invalid = [c for c in contacts if c.get("result") == "undeliverable"]
     no_email = [c for c in contacts if not c.get("email")]
 
+    usable = deliverable + catchall
+
     # Summary sheet
     ws_summary = wb.active
     ws_summary.title = "Summary"
-    ws_summary.column_dimensions["A"].width = 36
+    ws_summary.column_dimensions["A"].width = 28
     ws_summary.column_dimensions["B"].width = 14
     ws_summary.column_dimensions["C"].width = 14
 
@@ -525,16 +507,14 @@ def export_xlsx(contacts: list[dict], output_path: Path):
         ("Total Contacts", len(contacts), "100%"),
         ("", "", ""),
         ("Deliverable (SMTP verified)", len(deliverable), f"{len(deliverable)/max(len(contacts),1)*100:.1f}%"),
-        ("Catch-All (RISKY — may bounce)", len(catchall), f"{len(catchall)/max(len(contacts),1)*100:.1f}%"),
-        ("Risky (other)", len(risky), f"{len(risky)/max(len(contacts),1)*100:.1f}%"),
-        ("Unknown (UNVERIFIED — do NOT send)", len(unknown), f"{len(unknown)/max(len(contacts),1)*100:.1f}%"),
-        ("Invalid (undeliverable)", len(invalid), f"{len(invalid)/max(len(contacts),1)*100:.1f}%"),
+        ("Catch-All", len(catchall), f"{len(catchall)/max(len(contacts),1)*100:.1f}%"),
+        ("Risky", len(risky), f"{len(risky)/max(len(contacts),1)*100:.1f}%"),
+        ("Unknown", len(unknown), f"{len(unknown)/max(len(contacts),1)*100:.1f}%"),
+        ("Invalid", len(invalid), f"{len(invalid)/max(len(contacts),1)*100:.1f}%"),
         ("No Email Found", len(no_email), f"{len(no_email)/max(len(contacts),1)*100:.1f}%"),
         ("", "", ""),
-        ("SAFE TO SEND (upload this sheet)", len(deliverable), f"{len(deliverable)/max(len(contacts),1)*100:.1f}%"),
-        ("", "", ""),
-        ("WARNING: Only upload the 'Safe to Send' sheet to Instantly.", "", ""),
-        ("Catch-all and unknown emails WILL bounce and damage sender reputation.", "", ""),
+        ("SAFE TO SEND", len(deliverable), f"{len(deliverable)/max(len(contacts),1)*100:.1f}%"),
+        ("ALL USABLE", len(usable), f"{len(usable)/max(len(contacts),1)*100:.1f}%"),
     ]
 
     for row_idx, (a, b, c) in enumerate(summary_data, 1):
@@ -552,8 +532,8 @@ def export_xlsx(contacts: list[dict], output_path: Path):
     ws_summary.cell(row=15, column=2).font = Font(bold=True, color="1F4E79")
 
     # Data sheets
-    _write_sheet(wb.create_sheet(), deliverable, "Safe to Send")
-    _write_sheet(wb.create_sheet(), catchall, "Catch-All (RISKY)")
+    _write_sheet(wb.create_sheet(), deliverable, "Deliverable")
+    _write_sheet(wb.create_sheet(), usable, "All Usable")
     _write_sheet(wb.create_sheet(), contacts, "All Contacts")
     if no_email:
         _write_sheet(wb.create_sheet(), no_email, "No Email")
@@ -695,8 +675,8 @@ async def run_pipeline(
     click.echo(f"  Unknown:         {counts.get('unknown', 0)}")
     click.echo(f"  Invalid:         {counts.get('undeliverable', 0)}")
     click.echo(f"  No email:        {counts.get('', 0)}")
-    click.echo(f"  SAFE TO SEND:    {counts.get('deliverable', 0)}  <-- only upload this to Instantly")
-    click.echo(f"  Catch-all:       {counts.get('accept_all', 0)}  <-- DO NOT upload (will bounce)")
+    click.echo(f"  SAFE TO SEND:    {counts.get('deliverable', 0)}")
+    click.echo(f"  ALL USABLE:      {counts.get('deliverable', 0) + counts.get('accept_all', 0)}")
     click.echo(f"\n  State saved: {state_path}")
 
     return contacts

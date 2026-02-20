@@ -12,8 +12,10 @@ services:
       - KADENVERIFY_HELO_DOMAIN=${KADENVERIFY_HELO_DOMAIN:-verify.kadenwood.com}
       - KADENVERIFY_FROM_ADDRESS=${KADENVERIFY_FROM_ADDRESS:-verify@kadenwood.com}
       - KADENVERIFY_CONCURRENCY=${KADENVERIFY_CONCURRENCY:-5}
+      - KADENVERIFY_CACHE_BACKEND=${KADENVERIFY_CACHE_BACKEND:-supabase}
+      - KADENVERIFY_SUPABASE_URL=${KADENVERIFY_SUPABASE_URL:-}
+      - KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY=${KADENVERIFY_SUPABASE_SERVICE_ROLE_KEY:-}
     volumes:
-      - ./verified.duckdb:/app/verified.duckdb
       - ./lists:/app/lists
     networks:
       - default

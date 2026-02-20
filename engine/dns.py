@@ -17,21 +17,33 @@ logger = logging.getLogger("kadenverify.dns")
 # DNS timeout in seconds
 DNS_TIMEOUT = 10.0
 
+# Reuse a single resolver instance and enable dnspython built-in cache.
+# This reduces repeated MX/A/AAAA lookups across large verification runs.
+_RESOLVER = dns.asyncresolver.Resolver()
+_RESOLVER.timeout = DNS_TIMEOUT
+_RESOLVER.lifetime = DNS_TIMEOUT
+_RESOLVER.cache = dns.resolver.Cache()
 
-def _detect_provider(mx_hosts: list[str]) -> Provider:
+
+
+def _detect_provider(mx_hosts: list[str], domain: str = "") -> Provider:
     """Detect email provider from MX hostnames.
 
     Checks the highest-priority (first) MX host against known patterns.
+    Uses domain to distinguish Gmail personal from Google Workspace.
     """
     if not mx_hosts:
         return Provider.generic
+
+    domain_lower = domain.lower().rstrip(".")
 
     for mx in mx_hosts:
         mx_lower = mx.lower().rstrip(".")
 
         # Google (Gmail / Google Workspace)
         if mx_lower.endswith(".google.com") or mx_lower.endswith(".googlemail.com"):
-            # Could be personal gmail or Google Workspace
+            if domain_lower in ("gmail.com", "googlemail.com"):
+                return Provider.gmail
             return Provider.google_workspace
 
         # Yahoo
@@ -56,9 +68,12 @@ async def lookup_mx(domain: str, timeout: float = DNS_TIMEOUT) -> DnsInfo:
 
     Returns DnsInfo with mx_hosts sorted by priority (lowest priority number first).
     """
-    resolver = dns.asyncresolver.Resolver()
-    resolver.timeout = timeout
-    resolver.lifetime = timeout
+    resolver = _RESOLVER
+    if timeout != DNS_TIMEOUT:
+        resolver = dns.asyncresolver.Resolver()
+        resolver.timeout = timeout
+        resolver.lifetime = timeout
+        resolver.cache = _RESOLVER.cache
 
     mx_hosts: list[str] = []
 
@@ -88,7 +103,7 @@ async def lookup_mx(domain: str, timeout: float = DNS_TIMEOUT) -> DnsInfo:
             logger.debug(f"AAAA lookup failed for {domain}: {e}")
 
     has_mx = len(mx_hosts) > 0
-    provider = _detect_provider(mx_hosts) if has_mx else Provider.generic
+    provider = _detect_provider(mx_hosts, domain) if has_mx else Provider.generic
 
     return DnsInfo(
         mx_hosts=mx_hosts,
