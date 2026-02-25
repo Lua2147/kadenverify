@@ -1,0 +1,484 @@
+"""KadenVerify HTTP API — drop-in replacement for OmniVerifier.
+
+Endpoints:
+  GET  /verify?email=...          Single email verification
+  POST /verify                    Single email verification (JSON body)
+  POST /verify/batch              Batch verification (JSON array)
+  GET  /v1/validate/{email}       OmniVerifier-compatible (investor-outreach)
+  POST /v1/verify                 OmniVerifier-compatible (kadenwood-ui)
+  GET  /health                    Health check
+  GET  /ready                     Readiness checks
+  GET  /stats                     Verification statistics
+  GET  /metrics                   Runtime metrics
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel
+
+# Ensure project root on path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from engine.models import Reachability, VerificationResult
+from engine.tiered_verifier import verify_email_tiered
+from engine.verifier import verify_batch, verify_email
+
+logger = logging.getLogger("kadenverify.server")
+
+# Configuration from environment
+API_KEY = os.environ.get("KADENVERIFY_API_KEY", "")
+HELO_DOMAIN = os.environ.get("KADENVERIFY_HELO_DOMAIN", "verify.kadenwood.com")
+FROM_ADDRESS = os.environ.get("KADENVERIFY_FROM_ADDRESS", "verify@kadenwood.com")
+CONCURRENCY = int(os.environ.get("KADENVERIFY_CONCURRENCY", "5"))
+MAX_BATCH_SIZE = 1000
+ENABLE_TIERED = os.environ.get("KADENVERIFY_TIERED", "true").lower() == "true"
+CACHE_BACKEND = os.environ.get("KADENVERIFY_CACHE_BACKEND", "duckdb").lower()
+RATE_LIMIT_BACKEND = os.environ.get("KADENVERIFY_RATE_LIMIT_BACKEND", "memory").lower()
+
+app = FastAPI(
+    title="KadenVerify",
+    description="Self-hosted email verification API",
+    version="0.1.0",
+)
+
+# --- Cache backends ---
+
+_cache_db = None
+_cache_update_count = 0
+_supabase_client = None
+
+
+def _get_cache_db():
+    """Get or create DuckDB connection for cache."""
+    global _cache_db
+    if _cache_db is None:
+        try:
+            import duckdb
+
+            cache_path = Path(__file__).parent / "verified.duckdb"
+            _cache_db = duckdb.connect(str(cache_path))
+            _cache_db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verified_emails (
+                    email VARCHAR PRIMARY KEY,
+                    normalized VARCHAR,
+                    reachability VARCHAR,
+                    is_deliverable BOOLEAN,
+                    is_catch_all BOOLEAN,
+                    is_disposable BOOLEAN,
+                    is_role BOOLEAN,
+                    is_free BOOLEAN,
+                    mx_host VARCHAR,
+                    smtp_code INTEGER,
+                    smtp_message VARCHAR,
+                    provider VARCHAR,
+                    domain VARCHAR,
+                    verified_at TIMESTAMP,
+                    error VARCHAR
+                )
+                """
+            )
+            logger.info(f"Cache DB connected: {cache_path}")
+        except Exception as e:
+            logger.error(f"Failed to initialize cache DB: {e}")
+            _cache_db = None
+    return _cache_db
+
+
+def _get_supabase_client():
+    """Get or create Supabase REST cache client from env."""
+    global _supabase_client
+    if _supabase_client is None:
+        try:
+            from store.supabase_io import supabase_client_from_env
+
+            _supabase_client = supabase_client_from_env()
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase client: {e}")
+            _supabase_client = None
+    return _supabase_client
+
+
+def _cache_lookup_duckdb(email: str) -> Optional[VerificationResult]:
+    db = _get_cache_db()
+    if not db:
+        return None
+
+    row = db.execute(
+        "SELECT * FROM verified_emails WHERE email = ?",
+        [email],
+    ).fetchone()
+    if not row:
+        return None
+
+    return VerificationResult(
+        email=row[0],
+        normalized=row[1],
+        reachability=Reachability(row[2]),
+        is_deliverable=row[3],
+        is_catch_all=row[4],
+        is_disposable=row[5],
+        is_role=row[6],
+        is_free=row[7],
+        mx_host=row[8],
+        smtp_code=row[9],
+        smtp_message=row[10],
+        provider=row[11],
+        domain=row[12],
+        verified_at=row[13],
+        error=row[14],
+    )
+
+
+async def _cache_lookup(email: str) -> Optional[VerificationResult]:
+    """Look up cached verification result from configured backend."""
+    try:
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if not client:
+                _metrics["cache"]["misses"] += 1
+                return None
+            cached = client.get_by_email(email)
+        else:
+            cached = _cache_lookup_duckdb(email)
+
+        if cached:
+            _metrics["cache"]["hits"] += 1
+        else:
+            _metrics["cache"]["misses"] += 1
+        return cached
+    except Exception as e:
+        logger.error(f"Cache lookup error for {email}: {e}")
+        _metrics["cache"]["misses"] += 1
+        return None
+
+
+def _cache_update(result: VerificationResult):
+    """Write a verification result to the configured cache backend."""
+    global _cache_update_count
+    try:
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if not client:
+                return
+            client.upsert_result(result)
+            return
+
+        db = _get_cache_db()
+        if not db:
+            return
+
+        db.execute(
+            """
+            INSERT OR REPLACE INTO verified_emails VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                result.email,
+                result.normalized,
+                result.reachability.value,
+                result.is_deliverable,
+                result.is_catch_all,
+                result.is_disposable,
+                result.is_role,
+                result.is_free,
+                result.mx_host,
+                result.smtp_code,
+                result.smtp_message,
+                result.provider.value,
+                result.domain,
+                result.verified_at,
+                result.error,
+            ],
+        )
+        db.commit()
+
+        _cache_update_count += 1
+        if _cache_update_count % 100 == 0:
+            db.execute("CHECKPOINT")
+    except Exception as e:
+        logger.error(f"Cache update error for {result.email}: {e}")
+
+
+async def _readiness_check_cache() -> dict:
+    """Readiness check for whichever cache backend is configured."""
+    try:
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if not client:
+                return {"ok": False, "backend": "supabase", "detail": "client not configured"}
+            client.get_by_email("__readiness__@example.invalid")
+            return {"ok": True, "backend": "supabase"}
+
+        db = _get_cache_db()
+        if not db:
+            return {"ok": False, "backend": "duckdb", "detail": "database unavailable"}
+        db.execute("SELECT 1").fetchone()
+        return {"ok": True, "backend": "duckdb"}
+    except Exception as e:
+        logger.error(f"Readiness cache check failed: {e}")
+        return {"ok": False, "backend": CACHE_BACKEND, "detail": str(e)}
+
+
+# --- Runtime metrics ---
+
+_metrics = {
+    "cache": {"backend": CACHE_BACKEND, "hits": 0, "misses": 0},
+    "rate_limited_429": 0,
+}
+_tier_latencies_ms: list[float] = []
+
+
+def _record_tier_latency(elapsed_ms: float):
+    _tier_latencies_ms.append(elapsed_ms)
+    if len(_tier_latencies_ms) > 1000:
+        del _tier_latencies_ms[:-1000]
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = int((len(ordered) - 1) * pct)
+    return round(ordered[idx], 2)
+
+
+def _tier_latency_summary() -> dict:
+    return {
+        "p50": _percentile(_tier_latencies_ms, 0.50),
+        "p95": _percentile(_tier_latencies_ms, 0.95),
+        "p99": _percentile(_tier_latencies_ms, 0.99),
+    }
+
+
+# --- Auth ---
+
+def _extract_api_key(request: Request) -> str:
+    key = request.headers.get("X-API-Key", "") or request.headers.get("x-api-key", "")
+    if key:
+        return key
+
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return ""
+
+
+async def verify_api_key(request: Request):
+    """Verify API key from X-API-Key header."""
+    if not API_KEY:
+        return
+    if request.headers.get("X-API-Key", "") != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+async def verify_api_key_compat(request: Request):
+    """Verify API key from X-API-Key, x-api-key, or Authorization: Bearer."""
+    if not API_KEY:
+        return
+    if _extract_api_key(request) != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+# --- Rate limiting ---
+
+_rate_limit_store: dict[str, list[float]] = {}
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 100
+
+
+def _rate_limit_bucket(request: Request) -> str:
+    client_ip = request.client.host if request.client else "unknown"
+    api_key = _extract_api_key(request)
+    return f"{client_ip}:{api_key or '-'}"
+
+
+def _prune_rate_limit_store(now: float):
+    for key, timestamps in list(_rate_limit_store.items()):
+        fresh = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+        if fresh:
+            _rate_limit_store[key] = fresh
+        else:
+            del _rate_limit_store[key]
+
+
+async def check_rate_limit(request: Request):
+    """Simple in-memory rate limiter with key isolation by API key."""
+    if RATE_LIMIT_BACKEND != "memory":
+        return
+
+    now = time.time()
+    _prune_rate_limit_store(now)
+
+    bucket = _rate_limit_bucket(request)
+    hits = _rate_limit_store.setdefault(bucket, [])
+    if len(hits) >= RATE_LIMIT_MAX:
+        _metrics["rate_limited_429"] += 1
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    hits.append(now)
+
+
+# --- Request models ---
+
+class SingleVerifyRequest(BaseModel):
+    email: str
+
+
+class BatchRequest(BaseModel):
+    emails: list[str]
+
+
+async def _verify_single_email(email: str) -> dict:
+    if ENABLE_TIERED:
+        started = time.perf_counter()
+        result, tier, reason = await verify_email_tiered(
+            email=email,
+            cache_lookup_fn=_cache_lookup,
+            cache_update_fn=_cache_update,
+            helo_domain=HELO_DOMAIN,
+            from_address=FROM_ADDRESS,
+        )
+        _record_tier_latency((time.perf_counter() - started) * 1000.0)
+        response = result.to_omniverifier()
+        response["_kadenverify_tier"] = tier
+        response["_kadenverify_reason"] = reason
+        return response
+
+    result = await verify_email(
+        email=email,
+        helo_domain=HELO_DOMAIN,
+        from_address=FROM_ADDRESS,
+    )
+    return result.to_omniverifier()
+
+
+# --- Endpoints ---
+
+@app.get("/verify", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+async def verify_single(email: str = Query(..., description="Email address to verify")):
+    return await _verify_single_email(email)
+
+
+@app.post("/verify", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+async def verify_single_post(request: SingleVerifyRequest):
+    return await _verify_single_email(request.email)
+
+
+@app.post("/verify/batch", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+async def verify_batch_endpoint(request: BatchRequest):
+    if len(request.emails) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch size exceeds maximum of {MAX_BATCH_SIZE}",
+        )
+    if not request.emails:
+        return []
+
+    try:
+        results = await verify_batch(
+            emails=request.emails,
+            concurrency=CONCURRENCY,
+            helo_domain=HELO_DOMAIN,
+            from_address=FROM_ADDRESS,
+        )
+    except Exception as e:
+        logger.error(f"Batch endpoint failed: {e}")
+        results = [
+            VerificationResult(
+                email=email,
+                normalized=email.strip().lower(),
+                reachability=Reachability.unknown,
+                is_deliverable=None,
+                domain=email.strip().split("@")[-1].lower() if "@" in email else "",
+                error="internal batch error",
+            )
+            for email in request.emails
+        ]
+    return [r.to_omniverifier() for r in results]
+
+
+# --- OmniVerifier-compatible routes ---
+# NOTE: /v1/validate/credits MUST be registered before /v1/validate/{email}
+
+@app.get("/v1/validate/credits", dependencies=[Depends(verify_api_key_compat)])
+async def omni_credits():
+    return {"credits": 999999, "remaining": 999999}
+
+
+@app.get("/v1/validate/{email}", dependencies=[Depends(verify_api_key_compat), Depends(check_rate_limit)])
+async def omni_validate_get(email: str):
+    result = await _verify_single_email(email)
+    result.pop("_kadenverify_tier", None)
+    result.pop("_kadenverify_reason", None)
+    return result
+
+
+@app.post("/v1/verify", dependencies=[Depends(verify_api_key_compat), Depends(check_rate_limit)])
+async def omni_verify_post(request: SingleVerifyRequest):
+    result = await _verify_single_email(request.email)
+    result.pop("_kadenverify_tier", None)
+    result.pop("_kadenverify_reason", None)
+    return result
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "kadenverify",
+        "version": "0.1.0",
+    }
+
+
+@app.get("/ready")
+async def ready():
+    cache_check = await _readiness_check_cache()
+    status = "ok" if cache_check.get("ok") else "degraded"
+    return {
+        "status": status,
+        "checks": {
+            "cache": cache_check,
+        },
+    }
+
+
+@app.get("/stats", dependencies=[Depends(verify_api_key)])
+async def stats_endpoint():
+    """Get verification statistics from active cache backend."""
+    try:
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if not client:
+                return {"error": "supabase client not configured", "total": 0}
+            return client.get_stats()
+
+        from store.duckdb_io import get_stats, init_verified_db
+
+        conn = init_verified_db()
+        stats = get_stats(conn)
+        conn.close()
+        return stats
+    except Exception as e:
+        return {"error": str(e), "total": 0}
+
+
+@app.get("/metrics", dependencies=[Depends(verify_api_key)])
+async def metrics_endpoint():
+    cache_readiness = await _readiness_check_cache()
+    return {
+        "tier_latency_ms": _tier_latency_summary(),
+        "cache": {
+            "backend": CACHE_BACKEND,
+            "hits": _metrics["cache"]["hits"],
+            "misses": _metrics["cache"]["misses"],
+            "ready": cache_readiness.get("ok", False),
+        },
+        "rate_limited_429": _metrics["rate_limited_429"],
+    }
