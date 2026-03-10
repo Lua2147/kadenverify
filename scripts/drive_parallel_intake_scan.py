@@ -2,25 +2,44 @@
 from __future__ import annotations
 
 import csv
-import io
 import json
+import os
 import re
+import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
 
-ROOT_FOLDER_ID = "1LMsC6GCXl0PlWkqImvew1EpTb4ROkNPU"
+ROOT_FOLDER_ID = (os.environ.get("DRIVE_ROOT_FOLDER_ID") or "1LMsC6GCXl0PlWkqImvew1EpTb4ROkNPU").strip()
 RUN_DIR = Path("/data/local-machine-backup/20260211/email-verifier-runs/tier1_tier2_v2_fullloop_20260211")
 OUT_BASE = RUN_DIR / "drive_parallel_intake"
-TOKEN_FILE = Path("/opt/mundi-princeps/config/token.json")
+PROVIDER_DIR = RUN_DIR / "provider_loop"
+DRIVE_HOLD_STATE_FILE = PROVIDER_DIR / "provider_reverify_state.drive_parallel_hold.csv"
+DRIVE_HOLD_VERIFIED_FILE = PROVIDER_DIR / "provider_candidates_verified.drive_parallel_hold.csv"
+DRIVE_HOLD_SOURCE = "drive_parallel_hold"
+TOKEN_FILE_DEFAULT = Path("/opt/mundi-princeps/config/token.json")
+TOKEN_FILE_ALT = Path("/opt/mundi-princeps/config/token_louis.json")
+TOKEN_FILE_OVERRIDE = Path((os.environ.get("DRIVE_TOKEN_FILE") or "").strip()) if (os.environ.get("DRIVE_TOKEN_FILE") or "").strip() else None
 DRIVE_API = "https://www.googleapis.com/drive/v3"
+EXCLUDE_SHEET_ID = (os.environ.get("DRIVE_EXCLUDE_SHEET_ID") or "").strip()
+EXCLUDE_SHEET_RANGE = (os.environ.get("DRIVE_EXCLUDE_SHEET_RANGE") or "G2:G").strip()
 REQUIRE_ASSET_HEAVY_SECTOR = False
+DOWNLOAD_WORKERS = max(1, int(os.environ.get("DRIVE_DOWNLOAD_WORKERS", "24")))
+MAX_CANDIDATE_FILES = max(0, int(os.environ.get("DRIVE_MAX_CANDIDATE_FILES", "0")))
+SHARD_COUNT = max(1, int(os.environ.get("DRIVE_SHARD_COUNT", "1")))
+SHARD_INDEX = max(0, int(os.environ.get("DRIVE_SHARD_INDEX", "0")))
+RUN_TAG_OVERRIDE = (os.environ.get("DRIVE_RUN_TAG") or "").strip()
+DRIVE_API_MAX_RETRIES = max(1, int(os.environ.get("DRIVE_API_MAX_RETRIES", "6")))
+DRIVE_API_BACKOFF_BASE_SECONDS = max(0.25, float(os.environ.get("DRIVE_API_BACKOFF_BASE_SECONDS", "1.0")))
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 US_CA_RE = re.compile(r"\b(united states|usa|u\.s\.?a?\.?|canada)\b", re.I)
+ACADEMIC_DOMAIN_RE = re.compile(r"(?:^|\.)(?:edu|ac\.[a-z]{2,})$", re.I)
 
 ALLOWED_TITLE_TOKENS = [
     "cfo",
@@ -186,6 +205,20 @@ EXCLUDE_NONPROFIT_KEYWORDS = [
     "public charity",
 ]
 
+EXCLUDE_HIGHER_ED_KEYWORDS = [
+    "higher education",
+    "university",
+    "state university",
+    "community college",
+    "junior college",
+    "college",
+    "polytechnic",
+]
+
+# Higher-ed NAICS:
+# 6112* = Junior Colleges, 6113* = Colleges/Universities/Professional Schools.
+EXCLUDE_HIGHER_ED_NAICS_PREFIXES = ("6112", "6113")
+
 ALLOWED_COMPANY_TYPES = {
     "privately held",
     "public company",
@@ -255,6 +288,55 @@ SIZE_COLUMNS = [
 TYPE_COLUMNS = ["company_type", "Company Type", "Ownership Type", "Company Ownership Type"]
 COUNTRY_COLUMNS = ["Country", "country", "Company Country", "org_hq_country"]
 NAICS_COLUMNS = ["naics", "NAICS", "naics_codes", "NAICS Code", "Industry (NAICS/SIC)"]
+
+
+def _extract_scopes(token_data: dict) -> set[str]:
+    scopes = token_data.get("scopes")
+    if isinstance(scopes, str):
+        return {s.strip() for s in scopes.split() if s.strip()}
+    if isinstance(scopes, list):
+        return {str(s).strip() for s in scopes if str(s).strip()}
+    scope = token_data.get("scope")
+    if isinstance(scope, str):
+        return {s.strip() for s in scope.split() if s.strip()}
+    return set()
+
+
+def _token_has_drive_scope(path: Path) -> bool:
+    if not path.exists() or path.is_dir():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    scopes = _extract_scopes(data)
+    return any(s.startswith("https://www.googleapis.com/auth/drive") for s in scopes)
+
+
+def _resolve_token_file() -> Path:
+    candidates: list[Path] = []
+    if TOKEN_FILE_OVERRIDE is not None:
+        candidates.append(TOKEN_FILE_OVERRIDE)
+    candidates.extend([TOKEN_FILE_DEFAULT, TOKEN_FILE_ALT])
+
+    seen: set[Path] = set()
+    deduped = []
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        deduped.append(p)
+
+    for p in deduped:
+        if _token_has_drive_scope(p):
+            return p
+    for p in deduped:
+        if p.exists() and p.is_file():
+            return p
+    return TOKEN_FILE_DEFAULT
+
+
+TOKEN_FILE = _resolve_token_file()
 
 
 def clean(v: object) -> str:
@@ -345,10 +427,12 @@ def is_excluded_vertical(company: str, industry: str, naics_text: str, company_t
         ]
     )
 
-    # Hard domain exclusions for government/military.
+    # Hard domain exclusions for government/military + higher-ed.
     if domain:
         d = lclean(domain)
         if d.endswith(".gov") or d.endswith(".mil"):
+            return True
+        if ACADEMIC_DOMAIN_RE.search(d):
             return True
 
     if any(k in blob for k in EXCLUDE_FINANCE_KEYWORDS):
@@ -357,12 +441,17 @@ def is_excluded_vertical(company: str, industry: str, naics_text: str, company_t
         return True
     if any(k in blob for k in EXCLUDE_NONPROFIT_KEYWORDS):
         return True
+    if any(k in blob for k in EXCLUDE_HIGHER_ED_KEYWORDS):
+        return True
 
     # NAICS vertical exclusions:
     # 52* = Finance/Insurance, 92* = Public Administration, 813* = Nonprofit/Civic orgs.
+    # 6112* + 6113* = Higher-ed.
     naics_codes = re.findall(r"\d{3,6}", lclean(naics_text))
     for code in naics_codes:
         if code.startswith("52") or code.startswith("92") or code.startswith("813"):
+            return True
+        if code.startswith(EXCLUDE_HIGHER_ED_NAICS_PREFIXES):
             return True
 
     return False
@@ -449,32 +538,402 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         w.writerows(rows)
 
 
+def make_contact_key_from_row(row: dict) -> str:
+    first = lclean(row.get("first_name"))
+    last = lclean(row.get("last_name"))
+    full = clean(row.get("full_name"))
+    if full and (not first or not last):
+        parts = [p for p in full.split() if p]
+        if parts:
+            if not first:
+                first = lclean(parts[0])
+            if not last and len(parts) > 1:
+                last = lclean(parts[-1])
+
+    email = lclean(row.get("email"))
+    domain = lclean(row.get("domain"))
+    if not domain and "@" in email:
+        domain = email.split("@", 1)[1].strip()
+
+    local = email.split("@", 1)[0].strip().lower() if "@" in email else ""
+    local_tokens = [re.sub(r"[^a-z0-9]+", "", part) for part in re.split(r"[._+-]+", local) if part]
+    local_tokens = [part for part in local_tokens if part]
+
+    if local_tokens:
+        if not first and len(local_tokens) >= 1:
+            first = local_tokens[0]
+        if not last and len(local_tokens) >= 2:
+            last = local_tokens[-1]
+
+        if not last and len(local_tokens) == 1:
+            token = local_tokens[0]
+            if first and token.endswith(first) and len(token) > len(first):
+                prefix = token[: -len(first)]
+                if prefix and len(prefix) <= 2:
+                    last = first
+                    first = prefix
+                else:
+                    last = token
+            else:
+                last = token
+
+        if not first and len(local_tokens) == 1:
+            first = local_tokens[0]
+
+    if not (first and last and domain):
+        return ""
+    return f"{first}|{last}|{domain}"
+
+
+def load_identity_sets(paths: list[Path]) -> tuple[set[str], set[str]]:
+    contact_keys: set[str] = set()
+    emails: set[str] = set()
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            with p.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ck = lclean(row.get("contact_key", ""))
+                    if ck:
+                        contact_keys.add(ck)
+                    for c in ("email", "new_email"):
+                        e = lclean(row.get(c, ""))
+                        if EMAIL_RE.fullmatch(e or ""):
+                            emails.add(e)
+        except Exception:
+            continue
+    return contact_keys, emails
+
+
+def load_sheet_email_set(sheet_id: str, access_token: str, cell_range: str) -> set[str]:
+    if not sheet_id:
+        return set()
+
+    token_data: dict | None = None
+
+    def build_headers(force_refresh: bool = False) -> dict[str, str]:
+        nonlocal token_data, access_token
+        if force_refresh or not access_token:
+            token_data = load_token_data()
+            access_token = refresh_access_token(token_data)
+            if not access_token:
+                access_token = token_data.get("access_token") or token_data.get("token") or ""
+        return {"Authorization": f"Bearer {access_token}"} if access_token else {}
+
+    headers = build_headers()
+    if not headers:
+        return set()
+
+    meta = requests.get(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
+        headers=headers,
+        params={"fields": "sheets.properties.title"},
+        timeout=60,
+    )
+    if meta.status_code == 401:
+        headers = build_headers(force_refresh=True)
+        meta = requests.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
+            headers=headers,
+            params={"fields": "sheets.properties.title"},
+            timeout=60,
+        )
+    meta.raise_for_status()
+
+    titles = [
+        (sheet.get("properties") or {}).get("title", "")
+        for sheet in meta.json().get("sheets", [])
+        if (sheet.get("properties") or {}).get("title")
+    ]
+
+    emails: set[str] = set()
+    for title in titles:
+        safe_title = title.replace("'", "''")
+        rng = f"'{safe_title}'!{cell_range}"
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{quote(rng)}"
+        resp = requests.get(url, headers=headers, timeout=120)
+        if resp.status_code == 401:
+            headers = build_headers(force_refresh=True)
+            resp = requests.get(url, headers=headers, timeout=120)
+        if resp.status_code != 200:
+            continue
+        for row in resp.json().get("values", []):
+            email = lclean(row[0] if row else "")
+            if EMAIL_RE.fullmatch(email or ""):
+                emails.add(email)
+    return emails
+
+
+def _read_header(path: Path) -> list[str]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        return list(reader.fieldnames or [])
+
+
+def append_net_new_to_drive_hold(
+    rows: list[dict],
+    existing_contact_keys: set[str],
+    existing_emails: set[str],
+) -> dict[str, int]:
+    DRIVE_HOLD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DRIVE_HOLD_VERIFIED_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    state_fields = _read_header(DRIVE_HOLD_STATE_FILE)
+    if not state_fields:
+        state_fields = [
+            "contact_key",
+            "email",
+            "source",
+            "prev_result",
+            "current_result",
+            "resolved_iter",
+            "unknown_streak",
+            "next_retry_iter",
+        ]
+    verified_fields = _read_header(DRIVE_HOLD_VERIFIED_FILE)
+    if not verified_fields:
+        verified_fields = ["contact_key", "email", "source", "verify_result"]
+
+    state_file_exists = DRIVE_HOLD_STATE_FILE.exists() and DRIVE_HOLD_STATE_FILE.stat().st_size > 0
+    verified_file_exists = DRIVE_HOLD_VERIFIED_FILE.exists() and DRIVE_HOLD_VERIFIED_FILE.stat().st_size > 0
+
+    added = 0
+    skipped_missing_key = 0
+    skipped_existing = 0
+
+    with DRIVE_HOLD_STATE_FILE.open("a", encoding="utf-8", newline="") as sf, DRIVE_HOLD_VERIFIED_FILE.open(
+        "a", encoding="utf-8", newline=""
+    ) as vf:
+        sw = csv.DictWriter(sf, fieldnames=state_fields, extrasaction="ignore")
+        vw = csv.DictWriter(vf, fieldnames=verified_fields, extrasaction="ignore")
+        if not state_file_exists:
+            sw.writeheader()
+        if not verified_file_exists:
+            vw.writeheader()
+
+        for row in rows:
+            email = lclean(row.get("email"))
+            contact_key = make_contact_key_from_row(row)
+            if not email or not contact_key:
+                skipped_missing_key += 1
+                continue
+            if email in existing_emails or contact_key in existing_contact_keys:
+                skipped_existing += 1
+                continue
+
+            state_row = {k: "" for k in state_fields}
+            state_row["contact_key"] = contact_key
+            state_row["email"] = email
+            state_row["source"] = DRIVE_HOLD_SOURCE
+            if "prev_result" in state_fields:
+                state_row["prev_result"] = "unknown"
+            if "current_result" in state_fields:
+                state_row["current_result"] = "unknown"
+            if "resolved_iter" in state_fields:
+                state_row["resolved_iter"] = ""
+            if "unknown_streak" in state_fields:
+                state_row["unknown_streak"] = "0"
+            if "next_retry_iter" in state_fields:
+                state_row["next_retry_iter"] = ""
+
+            verified_row = {k: "" for k in verified_fields}
+            verified_row["contact_key"] = contact_key
+            verified_row["email"] = email
+            verified_row["source"] = DRIVE_HOLD_SOURCE
+            if "verify_result" in verified_fields:
+                verified_row["verify_result"] = "unknown"
+
+            sw.writerow(state_row)
+            vw.writerow(verified_row)
+
+            existing_emails.add(email)
+            existing_contact_keys.add(contact_key)
+            added += 1
+
+    return {
+        "added": added,
+        "skipped_missing_key": skipped_missing_key,
+        "skipped_existing": skipped_existing,
+    }
+
+
+def download_candidate(
+    f: dict,
+    dl_dir: Path,
+    access_token: str,
+    drive_get_sync,
+) -> tuple[dict | None, dict | None]:
+    fid = f["id"]
+    name = f.get("name", "file")
+    mt = f.get("mimeType", "")
+    ext = Path(name).suffix.lower()
+    try:
+        if mt == "application/vnd.google-apps.spreadsheet":
+            data = drive_get_sync(
+                f"https://www.googleapis.com/drive/v3/files/{fid}/export",
+                {"mimeType": "text/csv"},
+                stream=True,
+                export=True,
+                access_token=access_token,
+            )
+            out_ext = ".csv"
+        else:
+            data = drive_get_sync(
+                f"files/{fid}",
+                {"alt": "media"},
+                stream=True,
+                access_token=access_token,
+            )
+            if ext:
+                out_ext = ext
+            elif mt in ("text/csv", "application/csv"):
+                out_ext = ".csv"
+            elif "spreadsheet" in mt or "excel" in mt:
+                out_ext = ".xlsx"
+            else:
+                out_ext = ".bin"
+
+        out = dl_dir / f"{safe_name(Path(name).stem)}_{fid}{out_ext}"
+        out.write_bytes(data)
+        return (
+            {
+                "id": fid,
+                "name": name,
+                "mimeType": mt,
+                "modifiedTime": f.get("modifiedTime", ""),
+                "size": f.get("size", ""),
+                "path": str(out),
+            },
+            None,
+        )
+    except Exception as e:
+        return (
+            None,
+            {
+                "id": fid,
+                "name": name,
+                "mimeType": mt,
+                "error": str(e),
+            },
+        )
+
+
 def main() -> None:
+    if SHARD_INDEX >= SHARD_COUNT:
+        raise RuntimeError(f"Invalid shard settings: DRIVE_SHARD_INDEX={SHARD_INDEX} >= DRIVE_SHARD_COUNT={SHARD_COUNT}")
+
     token_data = load_token_data()
+    token_scopes = _extract_scopes(token_data)
+    has_drive_scope = any(s.startswith("https://www.googleapis.com/auth/drive") for s in token_scopes)
+    print(
+        f"token_file={TOKEN_FILE} token_scope_count={len(token_scopes)} has_drive_scope={int(has_drive_scope)}",
+        flush=True,
+    )
     access_token = refresh_access_token(token_data)
     if not access_token:
         raise RuntimeError("No Google access token")
 
     session = requests.Session()
 
-    def drive_get(endpoint: str, params: dict | None = None, stream: bool = False, export: bool = False, retry: int = 1):
+    def _retry_delay(resp: requests.Response | None, attempt: int) -> float:
+        if resp is not None:
+            hdr = (resp.headers.get("Retry-After") or "").strip()
+            if hdr:
+                try:
+                    return max(0.25, float(hdr))
+                except ValueError:
+                    pass
+        return min(60.0, DRIVE_API_BACKOFF_BASE_SECONDS * (2 ** attempt))
+
+    def drive_get(endpoint: str, params: dict | None = None, stream: bool = False, export: bool = False):
         nonlocal access_token, token_data
         params = dict(params or {})
         if not export:
             params.setdefault("supportsAllDrives", "true")
             params.setdefault("includeItemsFromAllDrives", "true")
         url = endpoint if endpoint.startswith("https://") else f"{DRIVE_API}/{endpoint}"
-        headers = {"Authorization": f"Bearer {access_token}"}
-        resp = session.get(url, params=params, headers=headers, timeout=120, stream=stream)
-        if resp.status_code == 401 and retry > 0:
-            access_token = refresh_access_token(token_data)
-            return drive_get(endpoint, params=params, stream=stream, export=export, retry=retry - 1)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Drive API error {resp.status_code}: {resp.text[:500]}")
-        return resp.content if stream else resp.json()
+        last_error: Exception | None = None
+        for attempt in range(DRIVE_API_MAX_RETRIES):
+            headers = {"Authorization": f"Bearer {access_token}"}
+            try:
+                resp = session.get(url, params=params, headers=headers, timeout=120, stream=stream)
+            except requests.RequestException as e:
+                last_error = e
+                if attempt >= DRIVE_API_MAX_RETRIES - 1:
+                    break
+                time.sleep(_retry_delay(None, attempt))
+                continue
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            if resp.status_code == 401 and attempt < DRIVE_API_MAX_RETRIES - 1:
+                access_token = refresh_access_token(token_data)
+                time.sleep(_retry_delay(resp, attempt))
+                continue
+
+            if resp.status_code in {429, 500, 502, 503, 504} and attempt < DRIVE_API_MAX_RETRIES - 1:
+                time.sleep(_retry_delay(resp, attempt))
+                continue
+
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Drive API error {resp.status_code}: {resp.text[:500]}")
+
+            return resp.content if stream else resp.json()
+
+        if last_error is not None:
+            raise RuntimeError(f"Drive API request failed after retries: {last_error}")
+        raise RuntimeError("Drive API request failed after retries")
+
+    def drive_get_sync(
+        endpoint: str,
+        params: dict | None = None,
+        stream: bool = False,
+        export: bool = False,
+        access_token: str | None = None,
+    ):
+        nonlocal token_data
+        params = dict(params or {})
+        if not export:
+            params.setdefault("supportsAllDrives", "true")
+            params.setdefault("includeItemsFromAllDrives", "true")
+        url = endpoint if endpoint.startswith("https://") else f"{DRIVE_API}/{endpoint}"
+        token = access_token or ""
+        last_error: Exception | None = None
+        for attempt in range(DRIVE_API_MAX_RETRIES):
+            headers = {"Authorization": f"Bearer {token}"}
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=180, stream=stream)
+            except requests.RequestException as e:
+                last_error = e
+                if attempt >= DRIVE_API_MAX_RETRIES - 1:
+                    break
+                time.sleep(_retry_delay(None, attempt))
+                continue
+
+            if resp.status_code == 401 and attempt < DRIVE_API_MAX_RETRIES - 1:
+                token = refresh_access_token(token_data)
+                time.sleep(_retry_delay(resp, attempt))
+                continue
+
+            if resp.status_code in {429, 500, 502, 503, 504} and attempt < DRIVE_API_MAX_RETRIES - 1:
+                time.sleep(_retry_delay(resp, attempt))
+                continue
+
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Drive API error {resp.status_code}: {resp.text[:500]}")
+
+            return resp.content if stream else resp.json()
+
+        if last_error is not None:
+            raise RuntimeError(f"Drive API request failed after retries: {last_error}")
+        raise RuntimeError("Drive API request failed after retries")
+
+    stamp = RUN_TAG_OVERRIDE or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = OUT_BASE / stamp
+    if SHARD_COUNT > 1:
+        out_dir = out_dir / f"shard_{SHARD_INDEX + 1}of{SHARD_COUNT}"
     dl_dir = out_dir / "downloads"
     out_dir.mkdir(parents=True, exist_ok=True)
     dl_dir.mkdir(parents=True, exist_ok=True)
@@ -526,53 +985,37 @@ def main() -> None:
         if ext in CONTACT_EXTS or mt in CONTACT_MIMES or looks_contact:
             candidates.append(f)
 
-    print(f"candidate_files={len(candidates)}")
+    # Prefer fresher files first; optionally cap candidate volume.
+    candidates.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
+    if MAX_CANDIDATE_FILES > 0:
+        candidates = candidates[:MAX_CANDIDATE_FILES]
+
+    total_candidates = len(candidates)
+    if SHARD_COUNT > 1:
+        candidates = [f for i, f in enumerate(candidates) if i % SHARD_COUNT == SHARD_INDEX]
+
+    print(f"candidate_files_total={total_candidates}")
+    print(f"shard_index={SHARD_INDEX} shard_count={SHARD_COUNT} shard_candidate_files={len(candidates)}")
+    print(f"download_workers={DOWNLOAD_WORKERS}")
 
     downloaded: list[dict] = []
     failed: list[dict] = []
 
-    for idx, f in enumerate(candidates, 1):
-        fid = f["id"]
-        name = f.get("name", "file")
-        mt = f.get("mimeType", "")
-        ext = Path(name).suffix.lower()
-        try:
-            if mt == "application/vnd.google-apps.spreadsheet":
-                data = drive_get(
-                    f"https://www.googleapis.com/drive/v3/files/{fid}/export",
-                    {"mimeType": "text/csv"},
-                    stream=True,
-                    export=True,
-                )
-                out_ext = ".csv"
-            else:
-                data = drive_get(f"files/{fid}", {"alt": "media"}, stream=True)
-                if ext:
-                    out_ext = ext
-                elif mt in ("text/csv", "application/csv"):
-                    out_ext = ".csv"
-                elif "spreadsheet" in mt or "excel" in mt:
-                    out_ext = ".xlsx"
-                else:
-                    out_ext = ".bin"
-
-            out = dl_dir / f"{safe_name(Path(name).stem)}_{fid}{out_ext}"
-            out.write_bytes(data)
-            downloaded.append(
-                {
-                    "id": fid,
-                    "name": name,
-                    "mimeType": mt,
-                    "modifiedTime": f.get("modifiedTime", ""),
-                    "size": f.get("size", ""),
-                    "path": str(out),
-                }
-            )
-        except Exception as e:
-            failed.append({"id": fid, "name": name, "mimeType": mt, "error": str(e)})
-
-        if idx % 50 == 0:
-            print(f"download_progress={idx}/{len(candidates)} ok={len(downloaded)} failed={len(failed)}")
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futs = [
+            pool.submit(download_candidate, f, dl_dir, access_token, drive_get_sync)
+            for f in candidates
+        ]
+        done = 0
+        for fut in as_completed(futs):
+            done += 1
+            ok_item, err_item = fut.result()
+            if ok_item:
+                downloaded.append(ok_item)
+            if err_item:
+                failed.append(err_item)
+            if done % 50 == 0 or done == len(futs):
+                print(f"download_progress={done}/{len(candidates)} ok={len(downloaded)} failed={len(failed)}")
 
     print(f"download_complete ok={len(downloaded)} failed={len(failed)}")
 
@@ -695,20 +1138,21 @@ def main() -> None:
         ext = p.suffix.lower()
         try:
             if ext in {".csv", ".tsv", ".txt"}:
-                raw = p.read_text(encoding="utf-8", errors="ignore")
-                sample = raw[:4096]
-                delim = ","
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
-                    delim = dialect.delimiter
-                except Exception:
-                    pass
-                reader = csv.DictReader(io.StringIO(raw), delimiter=delim)
-                for row in reader:
-                    if row:
-                        row_map = {str(k): clean(v) for k, v in row.items() if k is not None}
-                        if row_map:
-                            append_from_map(row_map, f)
+                with p.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+                    sample = fh.read(8192)
+                    fh.seek(0)
+                    delim = ","
+                    try:
+                        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+                        delim = dialect.delimiter
+                    except Exception:
+                        pass
+                    reader = csv.DictReader(fh, delimiter=delim)
+                    for row in reader:
+                        if row:
+                            row_map = {str(k): clean(v) for k, v in row.items() if k is not None}
+                            if row_map:
+                                append_from_map(row_map, f)
             elif ext in {".xlsx", ".xls"}:
                 import openpyxl
 
@@ -727,6 +1171,8 @@ def main() -> None:
                 wb.close()
         except Exception as e:
             parse_errors.append({"path": str(p), "error": str(e)})
+
+    print(f"parse_complete files={len(downloaded)} records={len(records)} parse_errors={len(parse_errors)}")
 
     print(f"criteria_matched_records_raw={len(records)} parse_errors={len(parse_errors)}")
 
@@ -751,21 +1197,40 @@ def main() -> None:
         RUN_DIR / "bulk_net_new_consolidated_sendable_2026-02-18.csv",
         RUN_DIR / "provider_loop" / "provider_reverify_additional_usable.csv",
         RUN_DIR / "provider_loop" / "provider_reverify_state.csv",
+        RUN_DIR / "provider_loop" / "provider_reverify_state.drive_parallel_hold.csv",
+        RUN_DIR / "provider_loop" / "provider_candidates_verified.drive_parallel_hold.csv",
     ]
-    existing_emails: set[str] = set()
-    for p in existing_files:
-        if not p.exists():
-            continue
-        with p.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                for c in ("email", "new_email"):
-                    e = lclean(row.get(c, ""))
-                    if EMAIL_RE.fullmatch(e or ""):
-                        existing_emails.add(e)
+    existing_contact_keys, existing_emails = load_identity_sets(existing_files)
+    excluded_sheet_emails = 0
+    if EXCLUDE_SHEET_ID:
+        sheet_emails = load_sheet_email_set(EXCLUDE_SHEET_ID, access_token, EXCLUDE_SHEET_RANGE)
+        excluded_sheet_emails = len(sheet_emails)
+        existing_emails |= sheet_emails
+        print(
+            f"sheet_exclusion_enabled=1 sheet_id={EXCLUDE_SHEET_ID} "
+            f"sheet_range={EXCLUDE_SHEET_RANGE} excluded_sheet_emails={excluded_sheet_emails}"
+        )
 
-    net_new = [r for r in criteria_with_email if lclean(r.get("email")) not in existing_emails]
+    net_new = []
+    for r in criteria_with_email:
+        email = lclean(r.get("email"))
+        if not email:
+            continue
+        contact_key = make_contact_key_from_row(r)
+        if email in existing_emails:
+            continue
+        if contact_key and contact_key in existing_contact_keys:
+            continue
+        net_new.append(r)
+
+    hold_stats = append_net_new_to_drive_hold(net_new, existing_contact_keys, existing_emails)
     print(f"existing_email_universe={len(existing_emails)} criteria_net_new={len(net_new)}")
+    print(
+        "drive_hold_append "
+        f"added={hold_stats['added']} "
+        f"skipped_missing_key={hold_stats['skipped_missing_key']} "
+        f"skipped_existing={hold_stats['skipped_existing']}"
+    )
 
     write_csv(out_dir / "downloaded_files.csv", downloaded)
     write_csv(out_dir / "failed_downloads.csv", failed)
@@ -777,18 +1242,28 @@ def main() -> None:
     summary = {
         "timestamp_utc": stamp,
         "root_folder_id": ROOT_FOLDER_ID,
+        "shard_index": SHARD_INDEX,
+        "shard_count": SHARD_COUNT,
         "drive_user": about.get("user", {}),
         "folders_scanned": len(folders_seen),
         "files_found": len(files),
-        "candidate_files": len(candidates),
+        "candidate_files_total": total_candidates,
+        "candidate_files_shard": len(candidates),
         "downloaded_files": len(downloaded),
         "failed_downloads": len(failed),
         "criteria_matched_records_raw": len(records),
         "criteria_matched_unique": len(criteria_records),
         "criteria_matched_with_email": len(criteria_with_email),
         "criteria_matched_no_email": len(criteria_no_email),
+        "existing_contact_key_universe": len(existing_contact_keys),
         "existing_email_universe": len(existing_emails),
+        "excluded_sheet_emails": excluded_sheet_emails,
         "criteria_matched_net_new_email": len(net_new),
+        "drive_hold_added": hold_stats["added"],
+        "drive_hold_skipped_missing_key": hold_stats["skipped_missing_key"],
+        "drive_hold_skipped_existing": hold_stats["skipped_existing"],
+        "drive_hold_state_file": str(DRIVE_HOLD_STATE_FILE),
+        "drive_hold_verified_file": str(DRIVE_HOLD_VERIFIED_FILE),
         "output_dir": str(out_dir),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

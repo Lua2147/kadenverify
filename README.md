@@ -9,6 +9,10 @@ Replaces paid SaaS services (OmniVerifier, MillionVerifier) with a self-hosted s
 - ✅ Scales infinitely (no per-verification charges)
 - ✅ Drop-in API compatibility (same response format)
 
+## Operational References
+
+- Data locations and external archives: [`DATA_SOURCES.md`](./DATA_SOURCES.md)
+
 ---
 
 ## Features
@@ -160,6 +164,65 @@ python cli.py pipeline --source-path contacts.duckdb --limit 10000
 ```bash
 python cli.py stats
 ```
+
+### Waterfall Pipeline (Resumable, In-Repo)
+
+```bash
+# End-to-end: split stage1 -> provider waterfall -> reverify -> final merge
+python cli.py waterfall orchestrate \
+  --run-dir /data/local-machine-backup/20260211/email-verifier-runs/tier1_tier2_v2_fullloop_20260211 \
+  --kadenverify-api-key "$KADENVERIFY_API_KEY" \
+  --wait-stage1
+
+# Queue unresolved round2 provider pass after reverify completes
+python cli.py waterfall queue-round2 \
+  --run-dir /data/local-machine-backup/20260211/email-verifier-runs/tier1_tier2_v2_fullloop_20260211 \
+  --kadenverify-api-key "$KADENVERIFY_API_KEY" \
+  --wait-reverify
+```
+
+### Parallel Sharded Reverify (Keepalive)
+
+`scripts/provider_keepalive_loop.sh` supports deterministic sharding for parallel workers.
+
+- `PARALLEL_SHARDS=1` (default): single worker mode
+- `PARALLEL_SHARDS=2+`: launches `waterfall_pipeline.sharded_reverify_cycle`
+- Shards are split by `contact_key` hash to avoid overlap
+- Per-cycle shard outputs are merged into the standard files:
+  - `provider_reverify_state.next.csv`
+  - `provider_reverify_additional_usable.next.csv`
+  - `provider_reverify_summary.next.txt`
+  - `provider_reverify_qa.next.json`
+
+Example systemd override env:
+
+```ini
+Environment=PARALLEL_SHARDS=2
+Environment=BATCH_SIZE=25
+Environment=CONCURRENCY=12
+Environment=REQUEST_TIMEOUT_SECONDS=60
+```
+
+### First-Pass-All Mode (Keepalive)
+
+Use this mode to run a first pass across the full unresolved population and avoid immediate re-verification loops.
+
+Recommended envs:
+
+```ini
+Environment=FIRST_PASS_ALL=1
+Environment=FIRST_PASS_FORCE_LOAD_ONCE=1
+Environment=FIRST_PASS_RETRY_GAP_ITERS=1000000
+Environment=MAX_PENDING_PER_ITER=120000
+Environment=HOLD_PROMOTE_PER_CYCLE=5000000
+```
+
+Behavior:
+
+- Forces `MAX_ITERS=1` (single iteration per cycle)
+- Sets `UNKNOWN_STREAK_LOCK=1` and very large retry gap to defer re-checks
+- Optional one-time `--force-load-from-verified` on first cycle (`FIRST_PASS_FORCE_LOAD_ONCE=1`)
+- Continues writing to standard `provider_reverify_*` outputs
 
 **Output:**
 ```

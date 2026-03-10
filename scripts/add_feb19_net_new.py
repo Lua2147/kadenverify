@@ -12,6 +12,7 @@ from urllib.parse import quote
 import requests
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+GOOD_RESULTS = {"deliverable", "accept_all", "catch_all", "catchall"}
 
 
 def clean(v: Optional[str]) -> str:
@@ -21,6 +22,17 @@ def clean(v: Optional[str]) -> str:
 def clean_email(v: Optional[str]) -> str:
     s = clean(v).lower()
     return s if EMAIL_RE.match(s) else ""
+
+
+def resolved_row_email(row: dict) -> str:
+    # Prefer fully-verified replacement addresses when present.
+    new_email = clean_email(row.get("new_email"))
+    new_result = clean(row.get("new_email_verify_result")).lower()
+    if new_email and (not new_result or new_result in GOOD_RESULTS):
+        return new_email
+
+    # Fallback for legacy files that only carry `email`.
+    return clean_email(row.get("email"))
 
 
 def clean_industry(v: Optional[str]) -> str:
@@ -218,7 +230,7 @@ def normalize_row(master: dict, header: list[str]) -> list[str]:
     for h in header:
         out[h] = clean(master.get(h))
 
-    out["email"] = clean(out.get("email")).lower()
+    out["email"] = resolved_row_email(master)
     out["industry"] = clean_industry(out.get("industry"))
     out["org_industry"] = clean_industry(out.get("org_industry"))
 
@@ -253,7 +265,7 @@ def load_sendable_set(sendable_csv: Path) -> set[str]:
     with sendable_csv.open("r", encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
-            e = clean_email(row.get("email"))
+            e = resolved_row_email(row)
             if e:
                 out.add(e)
     return out
@@ -267,7 +279,7 @@ def build_master_map(master_csv: Path, needed: set[str]) -> dict[str, dict]:
     with master_csv.open("r", encoding="utf-8-sig", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
-            e = clean_email(row.get("email"))
+            e = resolved_row_email(row)
             if not e or e not in needed:
                 continue
 

@@ -11,6 +11,7 @@ from urllib.parse import quote
 import requests
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+GOOD_RESULTS = {"deliverable", "accept_all", "catch_all", "catchall"}
 
 
 def clean(v: str | None) -> str:
@@ -122,9 +123,18 @@ def load_sendable(path: Path) -> set[str]:
     out: set[str] = set()
     with path.open("r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
-            e = clean_email(row.get("email"))
-            if e:
-                out.add(e)
+            # Prefer fully-verified replacements when present.
+            new_email = clean_email(row.get("new_email"))
+            new_result = clean(row.get("new_email_verify_result")).lower()
+            if new_email:
+                if not new_result or new_result in GOOD_RESULTS:
+                    out.add(new_email)
+                continue
+
+            # Backward-compatible fallback for legacy sendable files.
+            legacy = clean_email(row.get("email"))
+            if legacy:
+                out.add(legacy)
     return out
 
 

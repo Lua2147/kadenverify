@@ -4,39 +4,60 @@ Endpoints:
   GET  /verify?email=...          Single email verification
   POST /verify                    Single email verification (JSON body)
   POST /verify/batch              Batch verification (JSON array)
+  POST /find-email/batch          Batch email discovery for contacts
   GET  /v1/validate/{email}       OmniVerifier-compatible (investor-outreach)
   POST /v1/verify                 OmniVerifier-compatible (kadenwood-ui)
   GET  /health                    Health check
+  GET  /ready                     Readiness checks
   GET  /stats                     Verification statistics
+  GET  /metrics                   Runtime metrics
 """
 
-import asyncio
+from __future__ import annotations
+
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request, Depends
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 
 # Ensure project root on path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from engine.verifier import verify_email, verify_batch
-from engine.tiered_verifier import verify_email_tiered
-from engine.models import VerificationResult, Reachability
+from engine.models import Reachability, VerificationResult
+from engine.verifier import verify_batch, verify_email
+
+_TIERED_IMPORT_ERROR: Optional[str] = None
+try:
+    from engine.tiered_verifier import verify_email_tiered
+except Exception as _e:  # pragma: no cover - startup guard for optional tiered mode
+    verify_email_tiered = None
+    _TIERED_IMPORT_ERROR = repr(_e)
+
+_FIND_EMAIL_IMPORT_ERROR: Optional[str] = None
+try:
+    from engine.email_finder import find_emails_batch
+except Exception as _e:  # pragma: no cover - startup guard for optional endpoint
+    find_emails_batch = None
+    _FIND_EMAIL_IMPORT_ERROR = repr(_e)
 
 logger = logging.getLogger("kadenverify.server")
+logging.getLogger("asyncio").setLevel(logging.ERROR)
 
 # Configuration from environment
 API_KEY = os.environ.get("KADENVERIFY_API_KEY", "")
 HELO_DOMAIN = os.environ.get("KADENVERIFY_HELO_DOMAIN", "verify.kadenwood.com")
 FROM_ADDRESS = os.environ.get("KADENVERIFY_FROM_ADDRESS", "verify@kadenwood.com")
 CONCURRENCY = int(os.environ.get("KADENVERIFY_CONCURRENCY", "5"))
+DOMAIN_CONCURRENCY = int(os.environ.get("KADENVERIFY_DOMAIN_CONCURRENCY", "2"))
 MAX_BATCH_SIZE = 1000
 ENABLE_TIERED = os.environ.get("KADENVERIFY_TIERED", "true").lower() == "true"
+CACHE_BACKEND = os.environ.get("KADENVERIFY_CACHE_BACKEND", "duckdb").lower()
+RATE_LIMIT_BACKEND = os.environ.get("KADENVERIFY_RATE_LIMIT_BACKEND", "memory").lower()
 
 app = FastAPI(
     title="KadenVerify",
@@ -44,9 +65,12 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# --- DuckDB Cache for Tiered Verification ---
+# --- Cache backends ---
 
 _cache_db = None
+_cache_update_count = 0
+_supabase_client = None
+
 
 def _get_cache_db():
     """Get or create DuckDB connection for cache."""
@@ -54,11 +78,11 @@ def _get_cache_db():
     if _cache_db is None:
         try:
             import duckdb
+
             cache_path = Path(__file__).parent / "verified.duckdb"
             _cache_db = duckdb.connect(str(cache_path))
-
-            # Ensure table exists
-            _cache_db.execute("""
+            _cache_db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS verified_emails (
                     email VARCHAR PRIMARY KEY,
                     normalized VARCHAR,
@@ -76,7 +100,8 @@ def _get_cache_db():
                     verified_at TIMESTAMP,
                     error VARCHAR
                 )
-            """)
+                """
+            )
             logger.info(f"Cache DB connected: {cache_path}")
         except Exception as e:
             logger.error(f"Failed to initialize cache DB: {e}")
@@ -84,141 +109,246 @@ def _get_cache_db():
     return _cache_db
 
 
-def _cache_lookup(email: str) -> Optional[VerificationResult]:
-    """Look up email in cache."""
+def _get_supabase_client():
+    """Get or create Supabase REST cache client from env."""
+    global _supabase_client
+    if _supabase_client is None:
+        try:
+            from store.supabase_io import supabase_client_from_env
+
+            _supabase_client = supabase_client_from_env()
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase client: {e}")
+            _supabase_client = None
+    return _supabase_client
+
+
+def _cache_lookup_duckdb(email: str) -> Optional[VerificationResult]:
+    db = _get_cache_db()
+    if not db:
+        return None
+
+    row = db.execute(
+        "SELECT * FROM verified_emails WHERE email = ?",
+        [email],
+    ).fetchone()
+    if not row:
+        return None
+
+    return VerificationResult(
+        email=row[0],
+        normalized=row[1],
+        reachability=Reachability(row[2]),
+        is_deliverable=row[3],
+        is_catch_all=row[4],
+        is_disposable=row[5],
+        is_role=row[6],
+        is_free=row[7],
+        mx_host=row[8],
+        smtp_code=row[9],
+        smtp_message=row[10],
+        provider=row[11],
+        domain=row[12],
+        verified_at=row[13],
+        error=row[14],
+    )
+
+
+async def _cache_lookup(email: str) -> Optional[VerificationResult]:
+    """Look up cached verification result from configured backend."""
     try:
-        db = _get_cache_db()
-        if not db:
+        if CACHE_BACKEND == "none":
+            _metrics["cache"]["misses"] += 1
             return None
 
-        result = db.execute(
-            "SELECT * FROM verified_emails WHERE email = ?",
-            [email]
-        ).fetchone()
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if not client:
+                _metrics["cache"]["misses"] += 1
+                return None
+            cached = client.get_by_email(email)
+        else:
+            cached = _cache_lookup_duckdb(email)
 
-        if not result:
-            return None
-
-        # Convert to VerificationResult
-        from datetime import datetime
-        return VerificationResult(
-            email=result[0],
-            normalized=result[1],
-            reachability=Reachability(result[2]),
-            is_deliverable=result[3],
-            is_catch_all=result[4],
-            is_disposable=result[5],
-            is_role=result[6],
-            is_free=result[7],
-            mx_host=result[8],
-            smtp_code=result[9],
-            smtp_message=result[10],
-            provider=result[11],
-            domain=result[12],
-            verified_at=result[13],
-            error=result[14],
-        )
+        if cached:
+            _metrics["cache"]["hits"] += 1
+        else:
+            _metrics["cache"]["misses"] += 1
+        return cached
     except Exception as e:
         logger.error(f"Cache lookup error for {email}: {e}")
+        _metrics["cache"]["misses"] += 1
         return None
 
 
-_cache_update_count = 0
-
 def _cache_update(result: VerificationResult):
-    """Update cache with verification result."""
+    """Write a verification result to the configured cache backend."""
     global _cache_update_count
     try:
+        if CACHE_BACKEND == "none":
+            return
+
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if not client:
+                return
+            client.upsert_result(result)
+            return
+
         db = _get_cache_db()
         if not db:
             return
 
-        db.execute("""
+        db.execute(
+            """
             INSERT OR REPLACE INTO verified_emails VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            result.email,
-            result.normalized,
-            result.reachability.value,
-            result.is_deliverable,
-            result.is_catch_all,
-            result.is_disposable,
-            result.is_role,
-            result.is_free,
-            result.mx_host,
-            result.smtp_code,
-            result.smtp_message,
-            result.provider.value,
-            result.domain,
-            result.verified_at,
-            result.error,
-        ])
-        # Explicitly commit the transaction
+            """,
+            [
+                result.email,
+                result.normalized,
+                result.reachability.value,
+                result.is_deliverable,
+                result.is_catch_all,
+                result.is_disposable,
+                result.is_role,
+                result.is_free,
+                result.mx_host,
+                result.smtp_code,
+                result.smtp_message,
+                result.provider.value,
+                result.domain,
+                result.verified_at,
+                result.error,
+            ],
+        )
         db.commit()
 
-        # Checkpoint every 100 updates to keep WAL file size manageable
         _cache_update_count += 1
         if _cache_update_count % 100 == 0:
             db.execute("CHECKPOINT")
-            logger.info(f"Checkpointed database after {_cache_update_count} updates")
     except Exception as e:
         logger.error(f"Cache update error for {result.email}: {e}")
 
 
+async def _readiness_check_cache() -> dict:
+    """Readiness check for whichever cache backend is configured."""
+    try:
+        if CACHE_BACKEND == "none":
+            return {"ok": True, "backend": "none"}
+
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if not client:
+                return {"ok": False, "backend": "supabase", "detail": "client not configured"}
+            client.get_by_email("__readiness__@example.invalid")
+            return {"ok": True, "backend": "supabase"}
+
+        db = _get_cache_db()
+        if not db:
+            return {"ok": False, "backend": "duckdb", "detail": "database unavailable"}
+        db.execute("SELECT 1").fetchone()
+        return {"ok": True, "backend": "duckdb"}
+    except Exception as e:
+        logger.error(f"Readiness cache check failed: {e}")
+        return {"ok": False, "backend": CACHE_BACKEND, "detail": str(e)}
+
+
+# --- Runtime metrics ---
+
+_metrics = {
+    "cache": {"backend": CACHE_BACKEND, "hits": 0, "misses": 0},
+    "rate_limited_429": 0,
+}
+_tier_latencies_ms: list[float] = []
+
+
+def _record_tier_latency(elapsed_ms: float):
+    _tier_latencies_ms.append(elapsed_ms)
+    if len(_tier_latencies_ms) > 1000:
+        del _tier_latencies_ms[:-1000]
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = int((len(ordered) - 1) * pct)
+    return round(ordered[idx], 2)
+
+
+def _tier_latency_summary() -> dict:
+    return {
+        "p50": _percentile(_tier_latencies_ms, 0.50),
+        "p95": _percentile(_tier_latencies_ms, 0.95),
+        "p99": _percentile(_tier_latencies_ms, 0.99),
+    }
+
+
 # --- Auth ---
+
+def _extract_api_key(request: Request) -> str:
+    key = request.headers.get("X-API-Key", "") or request.headers.get("x-api-key", "")
+    if key:
+        return key
+
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return ""
+
 
 async def verify_api_key(request: Request):
     """Verify API key from X-API-Key header."""
     if not API_KEY:
-        return  # No auth configured
-    key = request.headers.get("X-API-Key", "")
-    if key != API_KEY:
+        return
+    if request.headers.get("X-API-Key", "") != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+async def verify_api_key_compat(request: Request):
+    """Verify API key from X-API-Key, x-api-key, or Authorization: Bearer."""
+    if not API_KEY:
+        return
+    if _extract_api_key(request) != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 # --- Rate limiting ---
 
 _rate_limit_store: dict[str, list[float]] = {}
-RATE_LIMIT_WINDOW = 60  # seconds
-RATE_LIMIT_MAX = 100  # requests per window
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 100
+
+
+def _rate_limit_bucket(request: Request) -> str:
+    client_ip = request.client.host if request.client else "unknown"
+    api_key = _extract_api_key(request)
+    return f"{client_ip}:{api_key or '-'}"
+
+
+def _prune_rate_limit_store(now: float):
+    for key, timestamps in list(_rate_limit_store.items()):
+        fresh = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+        if fresh:
+            _rate_limit_store[key] = fresh
+        else:
+            del _rate_limit_store[key]
 
 
 async def check_rate_limit(request: Request):
-    """Simple in-memory rate limiter."""
-    client_ip = request.client.host if request.client else "unknown"
-    import time
-    now = time.time()
-
-    if client_ip not in _rate_limit_store:
-        _rate_limit_store[client_ip] = []
-
-    # Clean old entries
-    _rate_limit_store[client_ip] = [
-        t for t in _rate_limit_store[client_ip]
-        if now - t < RATE_LIMIT_WINDOW
-    ]
-
-    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_MAX:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
-    _rate_limit_store[client_ip].append(now)
-
-
-# --- Auth (also accept Bearer token and x-api-key for OmniVerifier compat) ---
-
-async def verify_api_key_compat(request: Request):
-    """Verify API key from X-API-Key, x-api-key, or Authorization: Bearer header."""
-    if not API_KEY:
+    """Simple in-memory rate limiter with key isolation by API key."""
+    if RATE_LIMIT_BACKEND != "memory":
         return
-    key = (
-        request.headers.get("X-API-Key", "")
-        or request.headers.get("x-api-key", "")
-    )
-    if not key:
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            key = auth[7:]
-    if key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    now = time.time()
+    _prune_rate_limit_store(now)
+
+    bucket = _rate_limit_bucket(request)
+    hits = _rate_limit_store.setdefault(bucket, [])
+    if len(hits) >= RATE_LIMIT_MAX:
+        _metrics["rate_limited_429"] += 1
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    hits.append(now)
 
 
 # --- Request models ---
@@ -226,89 +356,171 @@ async def verify_api_key_compat(request: Request):
 class SingleVerifyRequest(BaseModel):
     email: str
 
+
 class BatchRequest(BaseModel):
     emails: list[str]
+
+
+class FindContactRequest(BaseModel):
+    first_name: str
+    last_name: str
+    domain: str
+    company_name: str = ""
+
+
+class FindBatchRequest(BaseModel):
+    contacts: list[FindContactRequest]
+
+
+async def _verify_single_email(email: str) -> dict:
+    if ENABLE_TIERED and verify_email_tiered is not None:
+        started = time.perf_counter()
+        result, tier, reason = await verify_email_tiered(
+            email=email,
+            cache_lookup_fn=_cache_lookup,
+            cache_update_fn=_cache_update,
+            helo_domain=HELO_DOMAIN,
+            from_address=FROM_ADDRESS,
+        )
+        _record_tier_latency((time.perf_counter() - started) * 1000.0)
+        response = result.to_omniverifier()
+        response["_kadenverify_tier"] = tier
+        response["_kadenverify_reason"] = reason
+        return response
+
+    if ENABLE_TIERED and verify_email_tiered is None:
+        logger.warning(f"tiered verification unavailable, falling back: {_TIERED_IMPORT_ERROR}")
+
+    result = await verify_email(
+        email=email,
+        helo_domain=HELO_DOMAIN,
+        from_address=FROM_ADDRESS,
+    )
+    return result.to_omniverifier()
 
 
 # --- Endpoints ---
 
 @app.get("/verify", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
 async def verify_single(email: str = Query(..., description="Email address to verify")):
-    """Verify a single email address.
+    return await _verify_single_email(email)
 
-    Returns OmniVerifier-compatible response with status: valid|invalid|catch_all|unknown.
-    Uses tiered verification for OmniVerifier-level speed (<50ms for cached results).
-    """
-    if ENABLE_TIERED:
-        result, tier, reason = await verify_email_tiered(
-            email=email,
-            cache_lookup_fn=_cache_lookup,
-            cache_update_fn=_cache_update,
-            helo_domain=HELO_DOMAIN,
-            from_address=FROM_ADDRESS,
-        )
-        response = result.to_omniverifier()
-        response["_kadenverify_tier"] = tier
-        response["_kadenverify_reason"] = reason
-        return response
-    else:
-        result = await verify_email(
-            email=email,
-            helo_domain=HELO_DOMAIN,
-            from_address=FROM_ADDRESS,
-        )
-        return result.to_omniverifier()
+
+@app.post("/verify", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+async def verify_single_post(request: SingleVerifyRequest):
+    return await _verify_single_email(request.email)
 
 
 @app.post("/verify/batch", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
 async def verify_batch_endpoint(request: BatchRequest):
-    """Verify a batch of email addresses (max 1000).
-
-    Returns list of OmniVerifier-compatible results.
-    """
     if len(request.emails) > MAX_BATCH_SIZE:
         raise HTTPException(
             status_code=400,
             detail=f"Batch size exceeds maximum of {MAX_BATCH_SIZE}",
         )
-
     if not request.emails:
         return []
 
-    results = await verify_batch(
-        emails=request.emails,
-        concurrency=CONCURRENCY,
-        helo_domain=HELO_DOMAIN,
-        from_address=FROM_ADDRESS,
-    )
+    try:
+        results = await verify_batch(
+            emails=request.emails,
+            concurrency=CONCURRENCY,
+            domain_concurrency=DOMAIN_CONCURRENCY,
+            helo_domain=HELO_DOMAIN,
+            from_address=FROM_ADDRESS,
+        )
+    except Exception as e:
+        logger.error(f"Batch endpoint failed: {e}")
+        results = [
+            VerificationResult(
+                email=email,
+                normalized=email.strip().lower(),
+                reachability=Reachability.unknown,
+                is_deliverable=None,
+                domain=email.strip().split("@")[-1].lower() if "@" in email else "",
+                error="internal batch error",
+            )
+            for email in request.emails
+        ]
     return [r.to_omniverifier() for r in results]
 
 
-@app.post("/verify", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
-async def verify_single_post(request: SingleVerifyRequest):
-    """Verify a single email (POST with JSON body).
+@app.post("/find-email/batch", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+async def find_email_batch_endpoint(request: FindBatchRequest):
+    if find_emails_batch is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"find-email endpoint unavailable: {_FIND_EMAIL_IMPORT_ERROR}",
+        )
+    if len(request.contacts) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch size exceeds maximum of {MAX_BATCH_SIZE}",
+        )
+    if not request.contacts:
+        return []
 
-    Uses tiered verification for OmniVerifier-level speed.
-    """
-    if ENABLE_TIERED:
-        result, tier, reason = await verify_email_tiered(
-            email=request.email,
-            cache_lookup_fn=_cache_lookup,
-            cache_update_fn=_cache_update,
+    contacts = [
+        {
+            "first_name": c.first_name.strip(),
+            "last_name": c.last_name.strip(),
+            "domain": c.domain.lower().strip().lstrip("@"),
+            "company_name": c.company_name,
+        }
+        for c in request.contacts
+    ]
+
+    try:
+        finder_results = await find_emails_batch(
+            contacts=contacts,
+            concurrency=CONCURRENCY,
             helo_domain=HELO_DOMAIN,
             from_address=FROM_ADDRESS,
         )
-        response = result.to_omniverifier()
-        response["_kadenverify_tier"] = tier
-        response["_kadenverify_reason"] = reason
-        return response
-    else:
-        result = await verify_email(
-            email=request.email,
-            helo_domain=HELO_DOMAIN,
-            from_address=FROM_ADDRESS,
+    except Exception as e:
+        logger.error(f"Find-email batch endpoint failed: {e}")
+        finder_results = [None] * len(contacts)
+
+    response = []
+    for contact, result in zip(contacts, finder_results):
+        if result is None:
+            response.append(
+                {
+                    "first_name": contact["first_name"],
+                    "last_name": contact["last_name"],
+                    "domain": contact["domain"],
+                    "company_name": contact.get("company_name", ""),
+                    "email": None,
+                    "confidence": 0.0,
+                    "method": "internal_error",
+                    "reachability": Reachability.unknown.value,
+                    "domain_is_catchall": None,
+                    "provider": "generic",
+                    "candidates_tried": 0,
+                    "cost": 0.0,
+                    "error": "internal finder error",
+                }
+            )
+            continue
+
+        response.append(
+            {
+                "first_name": contact["first_name"],
+                "last_name": contact["last_name"],
+                "domain": contact["domain"],
+                "company_name": contact.get("company_name", ""),
+                "email": result.email,
+                "confidence": result.confidence,
+                "method": result.method,
+                "reachability": result.reachability.value,
+                "domain_is_catchall": result.domain_is_catchall,
+                "provider": result.provider.value,
+                "candidates_tried": result.candidates_tried,
+                "cost": result.cost,
+                "error": result.error,
+            }
         )
-        return result.to_omniverifier()
+    return response
 
 
 # --- OmniVerifier-compatible routes ---
@@ -316,61 +528,27 @@ async def verify_single_post(request: SingleVerifyRequest):
 
 @app.get("/v1/validate/credits", dependencies=[Depends(verify_api_key_compat)])
 async def omni_credits():
-    """OmniVerifier-compatible credits endpoint (always returns unlimited)."""
     return {"credits": 999999, "remaining": 999999}
 
 
 @app.get("/v1/validate/{email}", dependencies=[Depends(verify_api_key_compat), Depends(check_rate_limit)])
 async def omni_validate_get(email: str):
-    """OmniVerifier-compatible GET endpoint (investor-outreach-platform).
-
-    Uses tiered verification for instant results (<50ms for cached).
-    """
-    if ENABLE_TIERED:
-        result, tier, reason = await verify_email_tiered(
-            email=email,
-            cache_lookup_fn=_cache_lookup,
-            cache_update_fn=_cache_update,
-            helo_domain=HELO_DOMAIN,
-            from_address=FROM_ADDRESS,
-        )
-        return result.to_omniverifier()
-    else:
-        result = await verify_email(
-            email=email,
-            helo_domain=HELO_DOMAIN,
-            from_address=FROM_ADDRESS,
-        )
-        return result.to_omniverifier()
+    result = await _verify_single_email(email)
+    result.pop("_kadenverify_tier", None)
+    result.pop("_kadenverify_reason", None)
+    return result
 
 
 @app.post("/v1/verify", dependencies=[Depends(verify_api_key_compat), Depends(check_rate_limit)])
 async def omni_verify_post(request: SingleVerifyRequest):
-    """OmniVerifier-compatible POST endpoint (kadenwood-ui).
-
-    Uses tiered verification for instant results (<50ms for cached).
-    """
-    if ENABLE_TIERED:
-        result, tier, reason = await verify_email_tiered(
-            email=request.email,
-            cache_lookup_fn=_cache_lookup,
-            cache_update_fn=_cache_update,
-            helo_domain=HELO_DOMAIN,
-            from_address=FROM_ADDRESS,
-        )
-        return result.to_omniverifier()
-    else:
-        result = await verify_email(
-            email=request.email,
-            helo_domain=HELO_DOMAIN,
-            from_address=FROM_ADDRESS,
-        )
-        return result.to_omniverifier()
+    result = await _verify_single_email(request.email)
+    result.pop("_kadenverify_tier", None)
+    result.pop("_kadenverify_reason", None)
+    return result
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
     return {
         "status": "ok",
         "service": "kadenverify",
@@ -378,14 +556,48 @@ async def health():
     }
 
 
+@app.get("/ready")
+async def ready():
+    cache_check = await _readiness_check_cache()
+    status = "ok" if cache_check.get("ok") else "degraded"
+    return {
+        "status": status,
+        "checks": {
+            "cache": cache_check,
+        },
+    }
+
+
 @app.get("/stats", dependencies=[Depends(verify_api_key)])
 async def stats_endpoint():
-    """Get verification statistics from verified.duckdb."""
+    """Get verification statistics from active cache backend."""
     try:
-        from store.duckdb_io import init_verified_db, get_stats
+        if CACHE_BACKEND == "supabase":
+            client = _get_supabase_client()
+            if not client:
+                return {"error": "supabase client not configured", "total": 0}
+            return client.get_stats()
+
+        from store.duckdb_io import get_stats, init_verified_db
+
         conn = init_verified_db()
-        s = get_stats(conn)
+        stats = get_stats(conn)
         conn.close()
-        return s
+        return stats
     except Exception as e:
         return {"error": str(e), "total": 0}
+
+
+@app.get("/metrics", dependencies=[Depends(verify_api_key)])
+async def metrics_endpoint():
+    cache_readiness = await _readiness_check_cache()
+    return {
+        "tier_latency_ms": _tier_latency_summary(),
+        "cache": {
+            "backend": CACHE_BACKEND,
+            "hits": _metrics["cache"]["hits"],
+            "misses": _metrics["cache"]["misses"],
+            "ready": cache_readiness.get("ok", False),
+        },
+        "rate_limited_429": _metrics["rate_limited_429"],
+    }

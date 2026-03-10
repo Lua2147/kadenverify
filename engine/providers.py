@@ -8,6 +8,7 @@ Different email providers have different SMTP behaviors:
 - Generic: Full SMTP + catch-all probe
 """
 
+import os
 from dataclasses import dataclass
 from .models import Provider
 
@@ -66,4 +67,14 @@ _PROVIDER_CONFIGS: dict[Provider, ProviderConfig] = {
 
 def get_config(provider: Provider) -> ProviderConfig:
     """Get verification configuration for a provider."""
-    return _PROVIDER_CONFIGS.get(provider, _PROVIDER_CONFIGS[Provider.generic])
+    cfg = _PROVIDER_CONFIGS.get(provider, _PROVIDER_CONFIGS[Provider.generic])
+    # Optional fast mode: disable catch-all probes globally for SMTP-valid-only runs.
+    if os.environ.get("KADENVERIFY_DISABLE_CATCH_ALL", "false").lower() in {"1", "true", "yes"}:
+        return ProviderConfig(
+            provider=cfg.provider,
+            do_smtp=cfg.do_smtp,
+            do_catch_all=False,
+            mark_risky=cfg.mark_risky,
+            notes=(cfg.notes + " | catch-all disabled by env").strip(),
+        )
+    return cfg

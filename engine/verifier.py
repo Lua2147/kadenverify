@@ -225,6 +225,7 @@ async def verify_email(
 async def verify_batch(
     emails: list[str],
     concurrency: int = DEFAULT_CONCURRENCY,
+    domain_concurrency: int = 2,
     helo_domain: str = "verify.kadenwood.com",
     from_address: str = "verify@kadenwood.com",
     progress_callback=None,
@@ -237,6 +238,7 @@ async def verify_batch(
     Args:
         emails: List of email addresses to verify.
         concurrency: Max concurrent SMTP connections.
+        domain_concurrency: Max concurrent checks per domain.
         helo_domain: Domain for EHLO command.
         from_address: Address for MAIL FROM.
         progress_callback: Optional callable(result) called after each verification.
@@ -257,27 +259,39 @@ async def verify_batch(
 
     await asyncio.gather(*[_resolve_domain(d) for d in unique_domains], return_exceptions=True)
 
-    # Domain-level lock to prevent simultaneous connections to same MX
-    domain_locks: dict[str, asyncio.Lock] = {}
+    # Domain-level limiter to prevent overloading single MX host while avoiding
+    # strict per-domain serialization that can cause batch timeouts.
+    domain_semaphores: dict[str, asyncio.Semaphore] = {}
 
     async def _verify_with_limit(email: str) -> VerificationResult:
         # Extract domain for domain-level locking
         parts = email.strip().split("@")
         domain = parts[-1].lower() if len(parts) == 2 else ""
 
-        # Get or create domain lock
-        if domain not in domain_locks:
-            domain_locks[domain] = asyncio.Lock()
+        # Get or create per-domain semaphore
+        if domain not in domain_semaphores:
+            domain_semaphores[domain] = asyncio.Semaphore(max(1, domain_concurrency))
 
         async with semaphore:
-            async with domain_locks[domain]:
-                result = await verify_email(
-                    email=email,
-                    helo_domain=helo_domain,
-                    from_address=from_address,
-                    dns_cache=dns_cache,
-                    catch_all_cache=catch_all_cache,
-                )
+            async with domain_semaphores[domain]:
+                try:
+                    result = await verify_email(
+                        email=email,
+                        helo_domain=helo_domain,
+                        from_address=from_address,
+                        dns_cache=dns_cache,
+                        catch_all_cache=catch_all_cache,
+                    )
+                except Exception as e:
+                    logger.error(f"Batch verification failed for {email}: {e}")
+                    result = VerificationResult(
+                        email=email,
+                        normalized=email.strip().lower(),
+                        reachability=Reachability.unknown,
+                        is_deliverable=None,
+                        domain=domain,
+                        error="internal verification error",
+                    )
                 if progress_callback:
                     progress_callback(result)
                 return result
@@ -286,13 +300,26 @@ async def verify_batch(
     indexed_emails = list(enumerate(emails))
     indexed_emails.sort(key=lambda x: x[1].split("@")[-1] if "@" in x[1] else "")
 
-    # Run all verifications
+    # Run all verifications. Use return_exceptions to ensure one task crash
+    # does not fail the entire batch request.
     tasks = [_verify_with_limit(email) for _, email in indexed_emails]
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Restore original order
     ordered_results = [None] * len(emails)
-    for (orig_idx, _), result in zip(indexed_emails, results):
+    for (orig_idx, email), result in zip(indexed_emails, results):
+        if isinstance(result, BaseException):
+            logger.error(f"Batch task crashed for {email}: {result}")
+            parts = email.strip().split("@")
+            domain = parts[-1].lower() if len(parts) == 2 else ""
+            result = VerificationResult(
+                email=email,
+                normalized=email.strip().lower(),
+                reachability=Reachability.unknown,
+                is_deliverable=None,
+                domain=domain,
+                error="internal verification task error",
+            )
         ordered_results[orig_idx] = result
 
     return ordered_results

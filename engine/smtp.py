@@ -7,6 +7,7 @@ Never sends DATA. Includes catch-all detection and greylisting retry.
 
 import asyncio
 import logging
+import os
 import random
 import string
 from typing import Optional
@@ -16,14 +17,35 @@ from .models import SmtpResponse
 
 logger = logging.getLogger("kadenverify.smtp")
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
 # Defaults
 DEFAULT_HELO_DOMAIN = "198-23-249-137-host.colocrossing.com"
 DEFAULT_FROM_ADDRESS = "postmaster@198-23-249-137-host.colocrossing.com"
-CONNECT_TIMEOUT = 10
-COMMAND_TIMEOUT = 10
-TOTAL_TIMEOUT = 45
-GREYLIST_DELAY = 35
-GREYLIST_RETRIES = 2
+CONNECT_TIMEOUT = _env_float("KADENVERIFY_SMTP_CONNECT_TIMEOUT", 10)
+COMMAND_TIMEOUT = _env_float("KADENVERIFY_SMTP_COMMAND_TIMEOUT", 10)
+TOTAL_TIMEOUT = _env_float("KADENVERIFY_SMTP_TOTAL_TIMEOUT", 45)
+GREYLIST_DELAY = max(0, _env_int("KADENVERIFY_SMTP_GREYLIST_DELAY", 35))
+GREYLIST_RETRIES = max(0, _env_int("KADENVERIFY_SMTP_GREYLIST_RETRIES", 2))
 SMTP_PORT = 25
 
 

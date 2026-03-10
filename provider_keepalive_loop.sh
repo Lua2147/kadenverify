@@ -9,19 +9,20 @@ REVERIFY_LOG="${REVERIFY_LOG:-$RUN/provider_reverify.log}"
 QUEUE_LOG="${QUEUE_LOG:-$RUN/queue_after_reverify.log}"
 KEEP_LOG="${KEEP_LOG:-$RUN/provider_keepalive.log}"
 
-# Throughput tuning
-BATCH_SIZE="${BATCH_SIZE:-500}"
-CONCURRENCY="${CONCURRENCY:-64}"
+# Throughput tuning (defaults tuned for fast, stable SMTP top-level passes)
+BATCH_SIZE="${BATCH_SIZE:-25}"
+CONCURRENCY="${CONCURRENCY:-24}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-0}"
-REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-180}"
-BATCH_MAX_ATTEMPTS="${BATCH_MAX_ATTEMPTS:-2}"
-MAX_PENDING_PER_ITER="${MAX_PENDING_PER_ITER:-250000}"
+REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-90}"
+BATCH_MAX_ATTEMPTS="${BATCH_MAX_ATTEMPTS:-1}"
+MAX_PENDING_PER_ITER="${MAX_PENDING_PER_ITER:-300000}"
 MAX_ITERS="${MAX_ITERS:-6}"
 PARALLEL_SHARDS="${PARALLEL_SHARDS:-1}"
 
 # Reverify stop tuning
 GAIN_STOP_ABS="${GAIN_STOP_ABS:-40}"
 GAIN_STOP_RATE="${GAIN_STOP_RATE:-0.00015}"
+GAIN_STOP_PER_10K="${GAIN_STOP_PER_10K:-2.0}"
 GAIN_STOP_STREAK="${GAIN_STOP_STREAK:-2}"
 MIN_PENDING_FOR_STOP="${MIN_PENDING_FOR_STOP:-50000}"
 UNKNOWN_STREAK_LOCK="${UNKNOWN_STREAK_LOCK:-3}"
@@ -33,10 +34,22 @@ FIRST_PASS_RETRY_GAP_ITERS="${FIRST_PASS_RETRY_GAP_ITERS:-1000000}"
 
 # Hot/cold prioritization tuning
 HOT_SOURCE_PREFIXES="${HOT_SOURCE_PREFIXES:-drive_parallel_hold}"
+HOT_DOMAIN_SUFFIXES="${HOT_DOMAIN_SUFFIXES:-}"
 HOT_PRIORITY_QUOTA="${HOT_PRIORITY_QUOTA:-80000}"
 FRESH_UNKNOWN_STREAK_MAX="${FRESH_UNKNOWN_STREAK_MAX:-0}"
+STRICT_HOT_ONLY="${STRICT_HOT_ONLY:-1}"
+FIRST_TOUCH_ONLY="${FIRST_TOUCH_ONLY:-1}"
 HOLD_PROMOTE_PER_CYCLE="${HOLD_PROMOTE_PER_CYCLE:-5000}"
 HOLD_PROMOTE_ON_ROTATE="${HOLD_PROMOTE_ON_ROTATE:-20000}"
+
+# Dead-domain skiplist tuning (rebuilt each cycle from state)
+DEAD_DOMAIN_SKIP_ENABLED="${DEAD_DOMAIN_SKIP_ENABLED:-1}"
+SKIP_DOMAIN_SUFFIXES="${SKIP_DOMAIN_SUFFIXES:-}"
+DEAD_DOMAIN_FILE="${DEAD_DOMAIN_FILE:-}"
+DEAD_DOMAIN_MIN_ROWS="${DEAD_DOMAIN_MIN_ROWS:-40}"
+DEAD_DOMAIN_BAD_RATIO="${DEAD_DOMAIN_BAD_RATIO:-0.98}"
+DEAD_DOMAIN_MAX_GOOD="${DEAD_DOMAIN_MAX_GOOD:-0}"
+DEAD_DOMAIN_MIN_UNKNOWN_STREAK="${DEAD_DOMAIN_MIN_UNKNOWN_STREAK:-2}"
 
 # Low-gain rotate tuning
 LOW_GAIN_ROTATE_ABS="${LOW_GAIN_ROTATE_ABS:-75}"
@@ -46,6 +59,8 @@ LOW_GAIN_ROTATE_STREAK="${LOW_GAIN_ROTATE_STREAK:-2}"
 # Guardrail: block suspicious state shrink before promotion
 MIN_STATE_RATIO="${MIN_STATE_RATIO:-0.80}"
 MIN_STATE_DROP_ROWS="${MIN_STATE_DROP_ROWS:-5000}"
+MIN_USABLE_RATIO="${MIN_USABLE_RATIO:-0.90}"
+MIN_USABLE_DROP_ROWS="${MIN_USABLE_DROP_ROWS:-5000}"
 
 PROVIDER_DIR="$RUN/provider_loop"
 FORENSICS_DIR="$PROVIDER_DIR/reverify_guardrail_forensics"
@@ -53,6 +68,9 @@ VERIFIED_FILE="$PROVIDER_DIR/provider_candidates_verified.csv"
 WATERFALL_FILE="$RUN/waterfall_unknown_undeliverable.csv"
 LOW_VALUE_PURGE_ON_START="${LOW_VALUE_PURGE_ON_START:-1}"
 LOW_VALUE_PURGE_MARKER="${LOW_VALUE_PURGE_MARKER:-$PROVIDER_DIR/.low_value_purge_done}"
+if [[ -z "$DEAD_DOMAIN_FILE" ]]; then
+  DEAD_DOMAIN_FILE="$PROVIDER_DIR/dead_domains_skip.txt"
+fi
 
 STATE_FILE="$PROVIDER_DIR/provider_reverify_state.csv"
 USABLE_FILE="$PROVIDER_DIR/provider_reverify_additional_usable.csv"
@@ -109,6 +127,106 @@ with open(path, "r", encoding="utf-8-sig", newline="") as f:
     for _ in r:
         n += 1
 print(n)
+PY
+}
+
+reconcile_hold_state_from_verified() {
+  python3 - "$HOLD_STATE_FILE" "$HOLD_VERIFIED_FILE" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+hold_state = Path(sys.argv[1])
+hold_verified = Path(sys.argv[2])
+
+stats = {
+    "status": "ok",
+    "added_from_verified": 0,
+    "hold_state_rows_before": 0,
+    "hold_verified_rows": 0,
+    "hold_state_rows_after": 0,
+}
+
+required_fields = [
+    "contact_key",
+    "email",
+    "source",
+    "prev_result",
+    "current_result",
+    "resolved_iter",
+    "unknown_streak",
+    "next_retry_iter",
+]
+
+if not hold_verified.exists() or hold_verified.stat().st_size == 0:
+    stats["status"] = "hold_verified_missing_or_empty"
+    print(json.dumps(stats, separators=(",", ":")))
+    raise SystemExit(0)
+
+state_fields: list[str] = []
+state_rows: list[dict] = []
+seen_keys: set[str] = set()
+seen_emails: set[str] = set()
+
+if hold_state.exists() and hold_state.stat().st_size > 0:
+    with hold_state.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        state_fields = list(reader.fieldnames or [])
+        for row in reader:
+            ck = (row.get("contact_key") or "").strip().lower()
+            em = (row.get("email") or "").strip().lower()
+            if ck:
+                seen_keys.add(ck)
+            if "@" in em:
+                seen_emails.add(em)
+            state_rows.append(dict(row))
+else:
+    state_fields = []
+
+for field in required_fields:
+    if field not in state_fields:
+        state_fields.append(field)
+
+stats["hold_state_rows_before"] = len(state_rows)
+
+with hold_verified.open("r", encoding="utf-8-sig", newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        stats["hold_verified_rows"] += 1
+        ck = (row.get("contact_key") or "").strip().lower()
+        em = (row.get("email") or "").strip().lower()
+        if not ck or "@" not in em:
+            continue
+        if ck in seen_keys or em in seen_emails:
+            continue
+
+        out = {k: "" for k in state_fields}
+        out["contact_key"] = ck
+        out["email"] = em
+        out["source"] = (row.get("source") or "drive_parallel_hold").strip().lower()
+        out["prev_result"] = "unknown"
+        out["current_result"] = "unknown"
+        out["resolved_iter"] = ""
+        out["unknown_streak"] = "0"
+        out["next_retry_iter"] = ""
+        state_rows.append(out)
+        seen_keys.add(ck)
+        seen_emails.add(em)
+        stats["added_from_verified"] += 1
+
+stats["hold_state_rows_after"] = len(state_rows)
+
+if stats["added_from_verified"] > 0:
+    tmp = hold_state.with_suffix(hold_state.suffix + ".reconcile_tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=state_fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in state_rows:
+            writer.writerow(row)
+    tmp.replace(hold_state)
+
+print(json.dumps(stats, separators=(",", ":")))
 PY
 }
 
@@ -604,7 +722,140 @@ run_low_value_purge_once() {
   date -u +%Y-%m-%dT%H:%M:%SZ > "$LOW_VALUE_PURGE_MARKER"
 }
 
+build_dead_domain_skiplist() {
+  local state_path="$1"
+  local out_path="$2"
+  python3 - "$state_path" "$out_path" "$DEAD_DOMAIN_MIN_ROWS" "$DEAD_DOMAIN_BAD_RATIO" "$DEAD_DOMAIN_MAX_GOOD" "$DEAD_DOMAIN_MIN_UNKNOWN_STREAK" <<'PY'
+import csv
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+min_rows = max(1, int(float(sys.argv[3] or "1")))
+bad_ratio_threshold = max(0.0, min(1.0, float(sys.argv[4] or "0")))
+max_good = max(0, int(float(sys.argv[5] or "0")))
+min_unknown_streak = max(0, int(float(sys.argv[6] or "0")))
+
+GOOD = {"deliverable", "accept_all"}
+stats = {
+    "status": "ok",
+    "state_path": str(state_path),
+    "out_path": str(out_path),
+    "scanned_rows": 0,
+    "domains_seen": 0,
+    "domains_skipped": 0,
+    "min_rows": min_rows,
+    "bad_ratio_threshold": bad_ratio_threshold,
+    "max_good": max_good,
+    "min_unknown_streak": min_unknown_streak,
+}
+
+
+def parse_int(value: str) -> int:
+    try:
+        return int((value or "").strip())
+    except Exception:
+        return 0
+
+
+def row_domain(row: dict) -> str:
+    email = (row.get("email") or "").strip().lower()
+    if "@" in email:
+        return email.split("@", 1)[1].strip()
+
+    domain = (row.get("domain") or "").strip().lower()
+    if domain:
+        return domain
+
+    key = (row.get("contact_key") or "").strip().lower()
+    parts = key.split("|")
+    if len(parts) == 3 and parts[2]:
+        return parts[2].strip()
+    return ""
+
+
+out_path.parent.mkdir(parents=True, exist_ok=True)
+if not state_path.exists() or state_path.stat().st_size == 0:
+    out_path.write_text("", encoding="utf-8")
+    stats["status"] = "missing_or_empty_state"
+    print(json.dumps(stats, separators=(",", ":")))
+    raise SystemExit(0)
+
+by_domain = defaultdict(lambda: {"total": 0, "good": 0, "hard_bad": 0, "high_streak": 0})
+with state_path.open("r", encoding="utf-8-sig", newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        stats["scanned_rows"] += 1
+        domain = row_domain(row)
+        if not domain:
+            continue
+
+        rec = by_domain[domain]
+        rec["total"] += 1
+
+        result = (row.get("current_result") or row.get("verify_result") or "").strip().lower()
+        if result in GOOD:
+            rec["good"] += 1
+        elif result and result != "unknown":
+            rec["hard_bad"] += 1
+
+        if parse_int(row.get("unknown_streak") or "0") >= min_unknown_streak:
+            rec["high_streak"] += 1
+
+skip_domains: list[str] = []
+for domain, rec in by_domain.items():
+    total = rec["total"]
+    good = rec["good"]
+    bad_weight = rec["hard_bad"] + rec["high_streak"]
+    bad_ratio = (bad_weight / total) if total > 0 else 0.0
+    if total >= min_rows and good <= max_good and bad_ratio >= bad_ratio_threshold:
+        skip_domains.append(domain)
+
+skip_domains.sort()
+out_path.write_text(("\n".join(skip_domains) + ("\n" if skip_domains else "")), encoding="utf-8")
+
+stats["domains_seen"] = len(by_domain)
+stats["domains_skipped"] = len(skip_domains)
+print(json.dumps(stats, separators=(",", ":")))
+PY
+}
+
 should_block_state_promotion() {
+  local prev_rows="$1"
+  local next_rows="$2"
+  local min_ratio="$3"
+  local min_drop_rows="$4"
+
+  python3 - "$prev_rows" "$next_rows" "$min_ratio" "$min_drop_rows" <<'PY'
+import sys
+
+prev_rows = int(sys.argv[1])
+next_rows = int(sys.argv[2])
+min_ratio = float(sys.argv[3])
+min_drop_rows = int(sys.argv[4])
+
+if prev_rows <= 0:
+    print(0)
+    raise SystemExit(0)
+
+if next_rows <= 0:
+    print(1)
+    raise SystemExit(0)
+
+if next_rows >= prev_rows:
+    print(0)
+    raise SystemExit(0)
+
+drop = prev_rows - next_rows
+ratio = next_rows / prev_rows
+print(1 if (drop >= min_drop_rows and ratio < min_ratio) else 0)
+PY
+}
+
+should_block_usable_promotion() {
   local prev_rows="$1"
   local next_rows="$2"
   local min_ratio="$3"
@@ -663,6 +914,14 @@ promote_next_files() {
 
 mkdir -p "$(dirname "$KEEP_LOG")" "$PROVIDER_DIR" "$FORENSICS_DIR"
 
+# Single-instance guard: ignore duplicate launchers and keep one active loop.
+LOCK_FILE="${LOCK_FILE:-$RUN/provider_keepalive.lock}"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  log_keep "duplicate_instance_detected lock=$LOCK_FILE pid=$$ action=exit"
+  exit 0
+fi
+
 while true; do
   CYCLE_START_EPOCH="$(date +%s)"
   echo "0" > "$RUN/queue_after_reverify.pid"
@@ -688,10 +947,30 @@ while true; do
     log_keep "first_pass_force_load cycle=1 marker_missing=$FIRST_PASS_FORCE_LOAD_MARKER"
   fi
 
+  STRICT_HOT_ONLY_FLAG=()
+  if [[ "$STRICT_HOT_ONLY" == "1" ]]; then
+    STRICT_HOT_ONLY_FLAG=(--strict-hot-only)
+  fi
+
+  FIRST_TOUCH_ONLY_FLAG=()
+  if [[ "$FIRST_TOUCH_ONLY" == "1" ]]; then
+    FIRST_TOUCH_ONLY_FLAG=(--first-touch-only)
+  fi
+
+  DEAD_DOMAIN_FILE_FLAG=()
+  if [[ "$DEAD_DOMAIN_SKIP_ENABLED" == "1" ]]; then
+    DEAD_DOMAIN_STATS="$(build_dead_domain_skiplist "$STATE_FILE" "$DEAD_DOMAIN_FILE")"
+    log_keep "dead_domain_skip stats=$DEAD_DOMAIN_STATS"
+    DEAD_DOMAIN_FILE_FLAG=(--skip-domain-file "$DEAD_DOMAIN_FILE")
+  fi
+  log_keep "mode strict_hot_only=$STRICT_HOT_ONLY first_touch_only=$FIRST_TOUCH_ONLY hot_sources=$HOT_SOURCE_PREFIXES hot_domains=$HOT_DOMAIN_SUFFIXES gain_stop_per_10k=$GAIN_STOP_PER_10K"
+
   HOLD_PROMOTE_ROWS="$HOLD_PROMOTE_PER_CYCLE"
   if [[ "$ROTATE_BOOST" == "1" ]]; then
     HOLD_PROMOTE_ROWS="$((HOLD_PROMOTE_PER_CYCLE + HOLD_PROMOTE_ON_ROTATE))"
   fi
+  HOLD_RECONCILE_STATS="$(reconcile_hold_state_from_verified)"
+  log_keep "hold_reconcile stats=$HOLD_RECONCILE_STATS"
   HOLD_PROMOTE_STATS="$(promote_drive_hold_rows "$HOLD_PROMOTE_ROWS")"
   PROMOTED_HOLD_ROWS="$(json_field "$HOLD_PROMOTE_STATS" "promoted")"
   REMAIN_HOLD_STATE="$(json_field "$HOLD_PROMOTE_STATS" "remaining_hold_state")"
@@ -726,16 +1005,22 @@ while true; do
       --cooldown-seconds "$COOLDOWN_SECONDS" \
       --gain-stop-abs "$GAIN_STOP_ABS" \
       --gain-stop-rate "$GAIN_STOP_RATE" \
+      --gain-stop-per-10k "$GAIN_STOP_PER_10K" \
       --gain-stop-streak "$GAIN_STOP_STREAK" \
       --min-pending-for-stop "$MIN_PENDING_FOR_STOP" \
       --unknown-streak-lock "$UNKNOWN_STREAK_LOCK" \
       --unknown-retry-gap-iters "$UNKNOWN_RETRY_GAP_ITERS" \
       --good-results "$GOOD_RESULTS" \
       --hot-source-prefixes "$HOT_SOURCE_PREFIXES" \
+      --hot-domain-suffixes "$HOT_DOMAIN_SUFFIXES" \
       --hot-priority-quota "$HOT_PRIORITY_QUOTA" \
+      --skip-domain-suffixes "$SKIP_DOMAIN_SUFFIXES" \
       --fresh-unknown-streak-max "$FRESH_UNKNOWN_STREAK_MAX" \
       --qa-report "$QA_NEXT" \
       --shard-count "$PARALLEL_SHARDS" \
+      "${STRICT_HOT_ONLY_FLAG[@]}" \
+      "${FIRST_TOUCH_ONLY_FLAG[@]}" \
+      "${DEAD_DOMAIN_FILE_FLAG[@]}" \
       "${FORCE_LOAD_FROM_VERIFIED_FLAG[@]}" \
       >> "$REVERIFY_LOG" 2>&1 &
   else
@@ -757,15 +1042,21 @@ while true; do
       --cooldown-seconds "$COOLDOWN_SECONDS" \
       --gain-stop-abs "$GAIN_STOP_ABS" \
       --gain-stop-rate "$GAIN_STOP_RATE" \
+      --gain-stop-per-10k "$GAIN_STOP_PER_10K" \
       --gain-stop-streak "$GAIN_STOP_STREAK" \
       --min-pending-for-stop "$MIN_PENDING_FOR_STOP" \
       --unknown-streak-lock "$UNKNOWN_STREAK_LOCK" \
       --unknown-retry-gap-iters "$UNKNOWN_RETRY_GAP_ITERS" \
       --good-results "$GOOD_RESULTS" \
       --hot-source-prefixes "$HOT_SOURCE_PREFIXES" \
+      --hot-domain-suffixes "$HOT_DOMAIN_SUFFIXES" \
       --hot-priority-quota "$HOT_PRIORITY_QUOTA" \
+      --skip-domain-suffixes "$SKIP_DOMAIN_SUFFIXES" \
       --fresh-unknown-streak-max "$FRESH_UNKNOWN_STREAK_MAX" \
       --qa-report "$QA_NEXT" \
+      "${STRICT_HOT_ONLY_FLAG[@]}" \
+      "${FIRST_TOUCH_ONLY_FLAG[@]}" \
+      "${DEAD_DOMAIN_FILE_FLAG[@]}" \
       "${FORCE_LOAD_FROM_VERIFIED_FLAG[@]}" \
       >> "$REVERIFY_LOG" 2>&1 &
   fi
@@ -804,6 +1095,12 @@ while true; do
     if [[ "$BLOCKED" == "1" ]]; then
       PROMOTE=0
       BLOCK_REASON="state_shrink_guard prev=$PREV_STATE_ROWS next=$NEXT_STATE_ROWS min_ratio=$MIN_STATE_RATIO min_drop_rows=$MIN_STATE_DROP_ROWS"
+    else
+      USABLE_BLOCKED="$(should_block_usable_promotion "$PREV_USABLE_ROWS" "$NEXT_USABLE_ROWS" "$MIN_USABLE_RATIO" "$MIN_USABLE_DROP_ROWS")"
+      if [[ "$USABLE_BLOCKED" == "1" ]]; then
+        PROMOTE=0
+        BLOCK_REASON="usable_shrink_guard prev=$PREV_USABLE_ROWS next=$NEXT_USABLE_ROWS min_ratio=$MIN_USABLE_RATIO min_drop_rows=$MIN_USABLE_DROP_ROWS"
+      fi
     fi
   fi
 

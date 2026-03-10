@@ -24,6 +24,8 @@ def parse_last_iter_metrics(summary_path: Path) -> tuple[dict[str, float], str]:
         "queried": 0.0,
         "verify_miss": 0.0,
         "backoff_skipped": 0.0,
+        "first_touch_skipped": 0.0,
+        "dead_domain_skipped": 0.0,
         "hot_eligible": 0.0,
         "hot_selected": 0.0,
         "cold_eligible": 0.0,
@@ -34,6 +36,7 @@ def parse_last_iter_metrics(summary_path: Path) -> tuple[dict[str, float], str]:
         "catch_all": 0.0,
         "gains": 0.0,
         "gain_rate": 0.0,
+        "gains_per_10k": 0.0,
         "remaining": 0.0,
     }
     stop_reason = ""
@@ -202,6 +205,8 @@ def write_merged_summary(
         "queried": 0.0,
         "verify_miss": 0.0,
         "backoff_skipped": 0.0,
+        "first_touch_skipped": 0.0,
+        "dead_domain_skipped": 0.0,
         "hot_eligible": 0.0,
         "hot_selected": 0.0,
         "cold_eligible": 0.0,
@@ -212,6 +217,7 @@ def write_merged_summary(
         "catch_all": 0.0,
         "gains": 0.0,
         "gain_rate": 0.0,
+        "gains_per_10k": 0.0,
         "remaining": float(int(qa_agg.get("remaining", 0) or 0)),
     }
     stop_reasons = []
@@ -225,6 +231,8 @@ def write_merged_summary(
             "queried",
             "verify_miss",
             "backoff_skipped",
+            "first_touch_skipped",
+            "dead_domain_skipped",
             "hot_eligible",
             "hot_selected",
             "cold_eligible",
@@ -242,6 +250,7 @@ def write_merged_summary(
     queried = int(agg["queried"])
     gains = int(agg["gains"])
     agg["gain_rate"] = (gains / queried) if queried > 0 else 0.0
+    agg["gains_per_10k"] = (gains / queried) * 10000.0 if queried > 0 else 0.0
     if not stop_reasons and qa_agg.get("stop_reason"):
         stop_reasons = [str(qa_agg.get("stop_reason"))]
     uniq = sorted(set(stop_reasons))
@@ -260,11 +269,12 @@ def write_merged_summary(
         (
             "  - iter={iter} pending={pending} eligible={eligible} queried={queried} "
             "verify_miss={verify_miss} backoff_skipped={backoff_skipped} "
+            "first_touch_skipped={first_touch_skipped} dead_domain_skipped={dead_domain_skipped} "
             "hot_eligible={hot_eligible} hot_selected={hot_selected} "
             "cold_eligible={cold_eligible} cold_selected={cold_selected} "
             "deferred_hot={deferred_hot} deferred_cold={deferred_cold} "
             "newly_deliverable={deliverable} newly_catch_all={catch_all} "
-            "gains={gains} gain_rate={gain_rate:.6f} remaining={remaining}"
+            "gains={gains} gain_rate={gain_rate:.6f} gains_per_10k={gains_per_10k:.2f} remaining={remaining}"
         ).format(
             iter=int(agg["iter"]),
             pending=int(agg["pending"]),
@@ -272,6 +282,8 @@ def write_merged_summary(
             queried=int(agg["queried"]),
             verify_miss=int(agg["verify_miss"]),
             backoff_skipped=int(agg["backoff_skipped"]),
+            first_touch_skipped=int(agg["first_touch_skipped"]),
+            dead_domain_skipped=int(agg["dead_domain_skipped"]),
             hot_eligible=int(agg["hot_eligible"]),
             hot_selected=int(agg["hot_selected"]),
             cold_eligible=int(agg["cold_eligible"]),
@@ -282,6 +294,7 @@ def write_merged_summary(
             catch_all=int(agg["catch_all"]),
             gains=int(agg["gains"]),
             gain_rate=float(agg["gain_rate"]),
+            gains_per_10k=float(agg["gains_per_10k"]),
             remaining=int(qa_agg.get("remaining", 0) or 0),
         ),
         "final_results:",
@@ -310,6 +323,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cooldown-seconds", type=int, default=0)
     p.add_argument("--gain-stop-abs", type=int, default=40)
     p.add_argument("--gain-stop-rate", type=float, default=0.00015)
+    p.add_argument("--gain-stop-per-10k", type=float, default=-1.0)
     p.add_argument("--gain-stop-streak", type=int, default=2)
     p.add_argument("--min-pending-for-stop", type=int, default=50000)
     p.add_argument("--unknown-streak-lock", type=int, default=3)
@@ -318,10 +332,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-max-attempts", type=int, default=2)
     p.add_argument("--good-results", default="deliverable,accept_all")
     p.add_argument("--hot-source-prefixes", default="drive_parallel_hold")
+    p.add_argument("--hot-domain-suffixes", default="")
     p.add_argument("--hot-priority-quota", type=int, default=80000)
+    p.add_argument("--strict-hot-only", action="store_true")
+    p.add_argument("--first-touch-only", action="store_true")
+    p.add_argument("--skip-domain-suffixes", default="")
+    p.add_argument("--skip-domain-file", default="")
     p.add_argument("--fresh-unknown-streak-max", type=int, default=0)
     p.add_argument("--qa-report", default="")
     p.add_argument("--shard-count", type=int, default=2)
+    p.add_argument("--force-load-from-verified", action="store_true")
     args = p.parse_args()
     if args.shard_count < 2:
         p.error("--shard-count must be >= 2 for sharded mode")
@@ -381,6 +401,8 @@ def main() -> None:
             str(args.gain_stop_abs),
             "--gain-stop-rate",
             str(args.gain_stop_rate),
+            "--gain-stop-per-10k",
+            str(args.gain_stop_per_10k),
             "--gain-stop-streak",
             str(args.gain_stop_streak),
             "--min-pending-for-stop",
@@ -393,8 +415,14 @@ def main() -> None:
             args.good_results,
             "--hot-source-prefixes",
             args.hot_source_prefixes,
+            "--hot-domain-suffixes",
+            args.hot_domain_suffixes,
             "--hot-priority-quota",
             str(args.hot_priority_quota),
+            "--skip-domain-suffixes",
+            args.skip_domain_suffixes,
+            "--skip-domain-file",
+            args.skip_domain_file,
             "--fresh-unknown-streak-max",
             str(args.fresh_unknown_streak_max),
             "--qa-report",
@@ -404,6 +432,12 @@ def main() -> None:
             "--shard-index",
             str(i),
         ]
+        if args.strict_hot_only:
+            cmd.append("--strict-hot-only")
+        if args.first_touch_only:
+            cmd.append("--first-touch-only")
+        if args.force_load_from_verified:
+            cmd.append("--force-load-from-verified")
         cmds.append(cmd)
 
     print(f"[reverify-sharded] launching shards={args.shard_count}", flush=True)
