@@ -121,6 +121,10 @@ async def verify_email_tiered(
             return result, tier_num, reason
 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
+    
+>>>>>>> Stashed changes
+=======
     
 >>>>>>> Stashed changes
 =======
